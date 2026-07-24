@@ -10,6 +10,7 @@
 - 客户端获得 `10.66.0.0/24` 地址并使用全隧道 IPv4 NAT 上网。
 - 支持 Let's Encrypt 和自签名两种服务器证书模式。
 - Let's Encrypt 证书路径复用 `/etc/vpn-maintenance.env` 中的 `LE_CONFIG_DIR` 与 `CERT_NAME`。
+- 自签名模式不依赖 Cloudflare DDNS、Certbot 或任何已签发证书，可以使用域名或裸 IPv4 endpoint 独立部署。
 - 与未来占用 `443` 的 SoftEther 共存，不修改系统 INPUT 默认策略。
 
 ## 非目标
@@ -83,6 +84,12 @@ OCSERV_CERT_MODE="letsencrypt"
 
 配置文件继续要求 root 所有、权限 `0600` 或 `0400`，且不能是符号链接。
 
+配置校验按证书模式区分：
+
+- 两种模式都只强制要求 ocserv 通用字段。
+- `selfsigned` 不读取或校验 `CF_DDNS_API_TOKEN`、`CF_ZONE_ID`、`CF_RECORD_NAMES`、`LE_EMAIL`、`CF_DNS_CREDENTIALS_FILE`、`CERT_NAME` 或 `LE_CONFIG_DIR`。
+- `letsencrypt` 额外要求 `CERT_NAME` 和 `LE_CONFIG_DIR`，以及对应 `live/` 证书文件；ocserv 安装器本身不要求 DDNS API 配置，因为证书必须在安装前已经签发。
+
 ## 命令接口
 
 ```text
@@ -114,7 +121,7 @@ sudo ./ocserv-deploy.sh help
 `install` 按以下顺序执行：
 
 1. 获取独占安装锁并确认以 root 运行。
-2. 校验 Ubuntu 版本、共享 env 的所有权与权限，以及所有 ocserv 配置字段。
+2. 校验 Ubuntu 版本、共享 env 的所有权与权限、ocserv 通用字段，以及当前证书模式实际需要的字段；不得因无关的 DDNS/ACME 字段缺失而阻止自签名部署。
 3. 记录调用前是否已存在 `/etc/ocserv/ocserv.conf`。
 4. 检查地址池是否与主机现有 IPv4 路由重叠。
 5. 检查目标 TCP/UDP 端口：
@@ -165,6 +172,7 @@ deploy hook 使用 Bash，因为共享 env 包含 Bash 数组。它读取同一�
 - 重复安装时复用现有自签名证书；若 SAN 与当前 endpoint 不匹配则停止，不静默覆盖。
 - 安装完成后输出 SHA-256 证书指纹，供客户端固定或人工确认。
 - 自签名模式不安装 Certbot deploy hook；从 Let's Encrypt 切换到自签名时，删除且仅删除带脚本管理标记的旧 ocserv hook。
+- 首次以自签名模式安装时，不创建 `/etc/letsencrypt/renewal-hooks/deploy/20-ocserv`，也不创建空占位 hook。
 
 ## ocserv 配置
 
@@ -230,6 +238,7 @@ systemd drop-in：
 - 使用 `set -Eeuo pipefail`，错误立即失败。
 - 不使用宽泛的成功回退，不吞掉包管理、证书、配置、nftables 或 systemd 错误。
 - API Token、证书私钥和用户密码不得写入日志。
+- 自签名模式不得调用 Certbot、Cloudflare API 或 `vpn-maintenance.sh`。
 - 不通过命令参数传递 VPN 用户密码。
 - 私钥和密码库保持 root-only。
 - endpoint、用户名、端口、CIDR、DNS 和接口名必须先验证再进入生成文件或命令。
@@ -277,3 +286,4 @@ systemd drop-in：
 4. OpenConnect/AnyConnect 客户端可以通过 `OCSERV_ENDPOINT:OCSERV_PORT` 登录并访问互联网。
 5. Let's Encrypt 续签后 ocserv 无需改路径即可加载新证书。
 6. SoftEther 后续可以使用 `443` 和独立地址池，不与 ocserv 配置互相覆盖。
+7. 未配置 DDNS、Cloudflare API 和 Certbot 时，用户仍可通过自签名模式和裸 IPv4 endpoint 完成部署；系统中不会新增 Certbot hook。
