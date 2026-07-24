@@ -107,6 +107,23 @@ LE_EMAIL="admin@example.com"
 
 通配符必须写在引号中，避免 Shell 将 `*` 展开成本地文件名。
 
+#### 证书路径的单一配置源
+
+后续的 ocserv 和 SoftEther 部署脚本不应分别硬编码 Certbot 路径。统一读取 `/etc/vpn-maintenance.env` 中的 `LE_CONFIG_DIR` 和 `CERT_NAME`，再派生证书路径：
+
+```bash
+source /etc/vpn-maintenance.env
+
+CERT_LIVE_DIR="${LE_CONFIG_DIR:-/etc/letsencrypt}/live/${CERT_NAME}"
+CERT_FULLCHAIN_FILE="${CERT_LIVE_DIR}/fullchain.pem"
+CERT_PRIVATE_KEY_FILE="${CERT_LIVE_DIR}/privkey.pem"
+```
+
+- SoftEther 安装脚本和 Certbot deploy hook 可以直接使用 `CERT_FULLCHAIN_FILE`、`CERT_PRIVATE_KEY_FILE` 调用 `vpncmd ServerCertSet`。
+- ocserv 配置文件不会展开 Shell 变量，因此 ocserv 部署脚本应读取 env，并把派生后的实际路径写入 `ocserv.conf`。
+- Certbot 续签只会原子更新 `live/` 目录中的软链接；只要 `CERT_NAME` 不变，ocserv 配置和 SoftEther hook 都不需要修改路径。
+- `/etc/vpn-maintenance.env` 为 root-only 文件，读取它的安装脚本和 hook 也应以 root 运行。
+
 脚本要求 `/etc/vpn-maintenance.env`：
 
 - 所有者为 `root`。
@@ -189,7 +206,7 @@ Certbot 支持三类 hook：
 
 ### ocserv 示例
 
-ocserv 配置直接引用 Certbot 文件：
+ocserv 部署脚本读取 env 后，生成的配置直接引用稳定的 Certbot `live/` 路径。例如：
 
 ```ini
 server-cert = /etc/letsencrypt/live/example.com/fullchain.pem
@@ -201,8 +218,11 @@ server-key = /etc/letsencrypt/live/example.com/privkey.pem
 ```sh
 #!/bin/sh
 
-[ "$RENEWED_LINEAGE" = \
-  "/etc/letsencrypt/live/example.com" ] || exit 0
+CONFIG_FILE="${VPN_MAINTENANCE_CONFIG:-/etc/vpn-maintenance.env}"
+. "$CONFIG_FILE"
+
+CERT_LIVE_DIR="${LE_CONFIG_DIR:-/etc/letsencrypt}/live/${CERT_NAME}"
+[ "$RENEWED_LINEAGE" = "$CERT_LIVE_DIR" ] || exit 0
 
 if systemctl is-active --quiet ocserv.service; then
   systemctl kill --kill-who=main --signal=HUP ocserv.service
@@ -223,7 +243,7 @@ SoftEther 不会持续读取 Certbot 文件，需要在另一个 deploy hook 中
 /etc/letsencrypt/renewal-hooks/deploy/30-softether
 ```
 
-SoftEther 安装脚本应先导入一次当前证书，再创建该 hook。管理员凭据不得硬编码进仓库。
+该 hook 同样读取 `/etc/vpn-maintenance.env` 并派生 `CERT_FULLCHAIN_FILE` 和 `CERT_PRIVATE_KEY_FILE`，再传给 `vpncmd`。SoftEther 安装脚本应先导入一次当前证书，再创建 hook。管理员凭据不得写入 env 或仓库，应放在独立的 root-only 凭据文件中。
 
 ## 状态与日志
 
