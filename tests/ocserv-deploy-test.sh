@@ -97,8 +97,298 @@ OCSERV_CERT_MODE="selfsigned"
   assert_failure validate_common_config
 }
 
+# ---------- Certificate test helpers ----------
+
+_generate_test_cert() {
+  local endpoint="$1" cert="$2" key="$3"
+  local san_type="DNS"
+  [[ "$endpoint" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && san_type="IP"
+  openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 2 \
+    -subj "/CN=${endpoint}" \
+    -addext "subjectAltName=${san_type}:${endpoint}" \
+    -keyout "$key" -out "$cert" 2>/dev/null
+}
+
+_generate_expired_test_cert() {
+  local cert="$1" key="$2"
+  CERT_OUT="$cert" KEY_OUT="$key" python3 - <<'PYEOF'
+import os, datetime
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+cert_path = os.environ["CERT_OUT"]
+key_path = os.environ["KEY_OUT"]
+private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "vpn.example.com")])
+cert = (
+    x509.CertificateBuilder()
+    .subject_name(subject)
+    .issuer_name(issuer)
+    .public_key(private_key.public_key())
+    .serial_number(x509.random_serial_number())
+    .not_valid_before(datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc))
+    .not_valid_after(datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc))
+    .add_extension(
+        x509.SubjectAlternativeName([x509.DNSName("vpn.example.com")]),
+        critical=False,
+    )
+    .sign(private_key, hashes.SHA256())
+)
+with open(cert_path, "wb") as f:
+    f.write(cert.public_bytes(serialization.Encoding.PEM))
+with open(key_path, "wb") as f:
+    f.write(private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    ))
+PYEOF
+}
+
+# ---------- Certificate tests ----------
+
+test_selfsigned_ip_san() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config '
+OCSERV_ENDPOINT="104.46.217.92"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  source_deployer
+  load_config
+  validate_common_config
+  prepare_certificate
+  openssl x509 -in "$SELF_SIGNED_CERT" -noout -text |
+    grep -q "IP Address:104.46.217.92" ||
+    fail "expected IP Address SAN in self-signed certificate"
+}
+
+test_selfsigned_dns_san() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  source_deployer
+  load_config
+  validate_common_config
+  prepare_certificate
+  openssl x509 -in "$SELF_SIGNED_CERT" -noout -text |
+    grep -q "DNS:vpn.example.com" ||
+    fail "expected DNS SAN in self-signed certificate"
+}
+
+test_selfsigned_reuse_matching_pair() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  source_deployer
+  load_config
+  validate_common_config
+  install -d -m 0700 "$(dirname "$SELF_SIGNED_CERT")"
+  _generate_test_cert "vpn.example.com" "$SELF_SIGNED_CERT" "$SELF_SIGNED_KEY"
+  assert_success prepare_certificate
+  assert_eq "$SELF_SIGNED_CERT" "$SERVER_CERT_FILE" "SERVER_CERT_FILE after reuse"
+  assert_eq "$SELF_SIGNED_KEY" "$SERVER_KEY_FILE" "SERVER_KEY_FILE after reuse"
+}
+
+test_selfsigned_one_missing_file_fails() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  source_deployer
+  load_config
+  validate_common_config
+  install -d -m 0700 "$(dirname "$SELF_SIGNED_CERT")"
+  _generate_test_cert "vpn.example.com" "$SELF_SIGNED_CERT" "$SELF_SIGNED_KEY"
+  rm -f -- "$SELF_SIGNED_KEY"
+  assert_failure prepare_certificate
+}
+
+test_letsencrypt_matching_san_succeeds() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  local le_dir="$TEST_ROOT/letsencrypt"
+  local cert_dir="${le_dir}/live/vpn.example.com"
+  install -d -m 0755 "$cert_dir"
+  _generate_test_cert "vpn.example.com" "${cert_dir}/fullchain.pem" "${cert_dir}/privkey.pem"
+  write_config "
+OCSERV_ENDPOINT=\"vpn.example.com\"
+OCSERV_PORT=\"8443\"
+OCSERV_IPV4_NETWORK=\"10.66.0.0/24\"
+OCSERV_DNS=(\"8.8.4.4\")
+OCSERV_CERT_MODE=\"letsencrypt\"
+CERT_NAME=\"vpn.example.com\"
+LE_CONFIG_DIR=\"${le_dir}\"
+"
+  source_deployer
+  load_config
+  validate_common_config
+  assert_success prepare_certificate
+}
+
+test_letsencrypt_missing_files_fail() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  local le_dir="$TEST_ROOT/letsencrypt"
+  write_config "
+OCSERV_ENDPOINT=\"vpn.example.com\"
+OCSERV_PORT=\"8443\"
+OCSERV_IPV4_NETWORK=\"10.66.0.0/24\"
+OCSERV_DNS=(\"8.8.4.4\")
+OCSERV_CERT_MODE=\"letsencrypt\"
+CERT_NAME=\"vpn.example.com\"
+LE_CONFIG_DIR=\"${le_dir}\"
+"
+  source_deployer
+  load_config
+  validate_common_config
+  assert_failure prepare_certificate
+}
+
+test_letsencrypt_mismatched_key_fails() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  local le_dir="$TEST_ROOT/letsencrypt"
+  local cert_dir="${le_dir}/live/vpn.example.com"
+  install -d -m 0755 "$cert_dir"
+  _generate_test_cert "vpn.example.com" "${cert_dir}/fullchain.pem" "${cert_dir}/privkey.pem"
+  openssl genrsa -out "${cert_dir}/privkey.pem" 2048 2>/dev/null
+  write_config "
+OCSERV_ENDPOINT=\"vpn.example.com\"
+OCSERV_PORT=\"8443\"
+OCSERV_IPV4_NETWORK=\"10.66.0.0/24\"
+OCSERV_DNS=(\"8.8.4.4\")
+OCSERV_CERT_MODE=\"letsencrypt\"
+CERT_NAME=\"vpn.example.com\"
+LE_CONFIG_DIR=\"${le_dir}\"
+"
+  source_deployer
+  load_config
+  validate_common_config
+  assert_failure prepare_certificate
+}
+
+test_letsencrypt_expired_cert_fails() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  local le_dir="$TEST_ROOT/letsencrypt"
+  local cert_dir="${le_dir}/live/vpn.example.com"
+  install -d -m 0755 "$cert_dir"
+  _generate_expired_test_cert "${cert_dir}/fullchain.pem" "${cert_dir}/privkey.pem"
+  write_config "
+OCSERV_ENDPOINT=\"vpn.example.com\"
+OCSERV_PORT=\"8443\"
+OCSERV_IPV4_NETWORK=\"10.66.0.0/24\"
+OCSERV_DNS=(\"8.8.4.4\")
+OCSERV_CERT_MODE=\"letsencrypt\"
+CERT_NAME=\"vpn.example.com\"
+LE_CONFIG_DIR=\"${le_dir}\"
+"
+  source_deployer
+  load_config
+  validate_common_config
+  assert_failure prepare_certificate
+}
+
+test_letsencrypt_endpoint_mismatch_fails() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  local le_dir="$TEST_ROOT/letsencrypt"
+  local cert_dir="${le_dir}/live/vpn.example.com"
+  install -d -m 0755 "$cert_dir"
+  _generate_test_cert "other.example.com" "${cert_dir}/fullchain.pem" "${cert_dir}/privkey.pem"
+  write_config "
+OCSERV_ENDPOINT=\"vpn.example.com\"
+OCSERV_PORT=\"8443\"
+OCSERV_IPV4_NETWORK=\"10.66.0.0/24\"
+OCSERV_DNS=(\"8.8.4.4\")
+OCSERV_CERT_MODE=\"letsencrypt\"
+CERT_NAME=\"vpn.example.com\"
+LE_CONFIG_DIR=\"${le_dir}\"
+"
+  source_deployer
+  load_config
+  validate_common_config
+  assert_failure prepare_certificate
+}
+
+test_render_certbot_hook() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="letsencrypt"
+'
+  source_deployer
+  local hook_out="$TEST_ROOT/test-hook"
+  render_certbot_hook "$hook_out"
+  [[ -f "$hook_out" ]] || fail "hook file was not created"
+  head -1 "$hook_out" | grep -q '^#!/usr/bin/env bash$' ||
+    fail "hook must start with #!/usr/bin/env bash"
+  grep -q 'source.*CONFIG_FILE' "$hook_out" ||
+    fail "hook must source CONFIG_FILE"
+  grep -q 'RENEWED_LINEAGE' "$hook_out" ||
+    fail "hook must compare RENEWED_LINEAGE"
+  grep -q 'systemctl reload ocserv.service' "$hook_out" ||
+    fail "hook must invoke systemctl reload ocserv.service"
+}
+
+test_selfsigned_no_hook_created() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  source_deployer
+  load_config
+  validate_common_config
+  prepare_certificate
+  [[ ! -f "$CERT_HOOK" ]] ||
+    fail "self-signed mode must not create a certbot hook"
+}
+
 run_test "valid common config" test_valid_common_config
 run_test "invalid port" test_rejects_invalid_port
 run_test "self-signed without DDNS" test_selfsigned_does_not_require_ddns_or_certbot_fields
 run_test "rejects scalar DNS" test_rejects_scalar_dns
+run_test "self-signed IP SAN" test_selfsigned_ip_san
+run_test "self-signed DNS SAN" test_selfsigned_dns_san
+run_test "self-signed reuse matching pair" test_selfsigned_reuse_matching_pair
+run_test "self-signed one missing file fails" test_selfsigned_one_missing_file_fails
+run_test "Lets Encrypt matching SAN succeeds" test_letsencrypt_matching_san_succeeds
+run_test "Lets Encrypt missing files fail" test_letsencrypt_missing_files_fail
+run_test "Lets Encrypt mismatched key fails" test_letsencrypt_mismatched_key_fails
+run_test "Lets Encrypt expired cert fails" test_letsencrypt_expired_cert_fails
+run_test "Lets Encrypt endpoint mismatch fails" test_letsencrypt_endpoint_mismatch_fails
+run_test "render certbot hook" test_render_certbot_hook
+run_test "self-signed no hook created" test_selfsigned_no_hook_created
 finish_tests

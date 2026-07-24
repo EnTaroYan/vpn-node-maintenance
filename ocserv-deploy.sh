@@ -18,6 +18,8 @@ readonly INSTALL_LOCK="${ROOT_PREFIX}/run/lock/ocserv-deploy.lock"
 declare -a NORMALIZED_DNS=()
 OCSERV_NETWORK_ADDRESS=""
 OCSERV_NETMASK=""
+SERVER_CERT_FILE=""
+SERVER_KEY_FILE=""
 
 log() {
   printf '%s [ocserv-deploy] %s\n' "$(date --iso-8601=seconds)" "$*"
@@ -108,6 +110,107 @@ validate_common_config() {
   for dns in "${NORMALIZED_DNS[@]}"; do
     valid_ipv4 "$dns" || die "invalid DNS address: $dns"
   done
+}
+
+validate_certificate_pair() {
+  local cert="$1" key="$2" cert_digest key_digest
+  [[ -f "$cert" && -f "$key" ]] || die "certificate or key is missing"
+  openssl x509 -in "$cert" -noout -checkend 0 >/dev/null ||
+    die "certificate is expired or invalid"
+  cert_digest="$(
+    openssl x509 -in "$cert" -pubkey -noout |
+      openssl pkey -pubin -outform DER |
+      sha256sum | awk '{print $1}'
+  )"
+  key_digest="$(
+    openssl pkey -in "$key" -pubout -outform DER |
+      sha256sum | awk '{print $1}'
+  )"
+  [[ "$cert_digest" == "$key_digest" ]] ||
+    die "certificate and private key do not match"
+}
+
+certificate_matches_endpoint() {
+  local cert="$1" endpoint="$2" result
+  if valid_ipv4 "$endpoint"; then
+    result="$(openssl x509 -in "$cert" -noout -checkip "$endpoint" 2>/dev/null)"
+  else
+    result="$(openssl x509 -in "$cert" -noout -checkhost "$endpoint" 2>/dev/null)"
+  fi
+  # OpenSSL 3.x -checkhost/-checkip always exits 0; distinguish via output text
+  [[ "$result" == *"does match"* ]]
+}
+
+generate_self_signed_certificate() {
+  install -d -m 0700 "$(dirname "$SELF_SIGNED_CERT")"
+  local temp_cert temp_key san_type
+  temp_cert="$(mktemp "$(dirname "$SELF_SIGNED_CERT")/.cert.XXXXXX")"
+  temp_key="$(mktemp "$(dirname "$SELF_SIGNED_KEY")/.key.XXXXXX")"
+  san_type="DNS"
+  valid_ipv4 "$OCSERV_ENDPOINT" && san_type="IP"
+  openssl req -x509 -newkey rsa:3072 -nodes -sha256 -days 3650 \
+    -subj "/CN=${OCSERV_ENDPOINT}" \
+    -addext "subjectAltName=${san_type}:${OCSERV_ENDPOINT}" \
+    -keyout "$temp_key" -out "$temp_cert"
+  chmod 0600 "$temp_key"
+  chmod 0644 "$temp_cert"
+  validate_certificate_pair "$temp_cert" "$temp_key"
+  certificate_matches_endpoint "$temp_cert" "$OCSERV_ENDPOINT" ||
+    die "generated certificate SAN does not match endpoint"
+  install -m 0600 "$temp_key" "$SELF_SIGNED_KEY"
+  install -m 0644 "$temp_cert" "$SELF_SIGNED_CERT"
+  rm -f -- "$temp_cert" "$temp_key"
+}
+
+prepare_selfsigned_certificate() {
+  if [[ -f "$SELF_SIGNED_CERT" && -f "$SELF_SIGNED_KEY" ]]; then
+    validate_certificate_pair "$SELF_SIGNED_CERT" "$SELF_SIGNED_KEY"
+    certificate_matches_endpoint "$SELF_SIGNED_CERT" "$OCSERV_ENDPOINT" ||
+      die "existing certificate SAN does not match endpoint"
+  elif [[ -f "$SELF_SIGNED_CERT" || -f "$SELF_SIGNED_KEY" ]]; then
+    die "only one of self-signed cert/key exists; refusing to overwrite"
+  else
+    generate_self_signed_certificate
+  fi
+  SERVER_CERT_FILE="$SELF_SIGNED_CERT"
+  SERVER_KEY_FILE="$SELF_SIGNED_KEY"
+}
+
+prepare_letsencrypt_certificate() {
+  [[ -n "${CERT_NAME:-}" ]] || die "missing CERT_NAME for letsencrypt mode"
+  LE_CONFIG_DIR="${LE_CONFIG_DIR:-/etc/letsencrypt}"
+  SERVER_CERT_FILE="${LE_CONFIG_DIR}/live/${CERT_NAME}/fullchain.pem"
+  SERVER_KEY_FILE="${LE_CONFIG_DIR}/live/${CERT_NAME}/privkey.pem"
+  validate_certificate_pair "$SERVER_CERT_FILE" "$SERVER_KEY_FILE"
+  certificate_matches_endpoint "$SERVER_CERT_FILE" "$OCSERV_ENDPOINT" ||
+    die "certificate SAN does not match endpoint"
+}
+
+prepare_certificate() {
+  case "$OCSERV_CERT_MODE" in
+    selfsigned) prepare_selfsigned_certificate ;;
+    letsencrypt) prepare_letsencrypt_certificate ;;
+  esac
+}
+
+render_certbot_hook() {
+  local output="$1"
+  install -d -m 0755 "$(dirname "$output")"
+  cat >"$output" <<'HOOK_EOF'
+#!/usr/bin/env bash
+# Managed by vpn-node-maintenance: ocserv-deploy.sh
+
+set -Eeuo pipefail
+
+readonly CONFIG_FILE="${VPN_MAINTENANCE_CONFIG:-/etc/vpn-maintenance.env}"
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+readonly CERT_LIVE_DIR="${LE_CONFIG_DIR:-/etc/letsencrypt}/live/${CERT_NAME}"
+[[ "${RENEWED_LINEAGE:-}" == "$CERT_LIVE_DIR" ]] || exit 0
+systemctl reload ocserv.service
+HOOK_EOF
+  chmod +x "$output"
 }
 
 usage() {
