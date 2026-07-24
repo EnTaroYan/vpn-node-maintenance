@@ -230,6 +230,72 @@ HOOK_EOF
   chmod +x "$output"
 }
 
+# ==================== User management ====================
+
+validate_username() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]
+}
+
+user_exists() {
+  local username="$1"
+  local password_file="${2:-$OCSERV_PASSWD}"
+  [[ -f "$password_file" ]] &&
+    awk -F: -v user="$username" '$1 == user { found=1 } END { exit !found }' \
+      "$password_file"
+}
+
+CONFIRMED_PASSWORD=""
+
+read_confirmed_password() {
+  local p1 p2
+  read -r -s -p "Password: " p1
+  printf '\n'
+  read -r -s -p "Confirm password: " p2
+  printf '\n'
+  [[ -n "$p1" ]] || die "password cannot be empty"
+  [[ "$p1" == "$p2" ]] || die "passwords do not match"
+  CONFIRMED_PASSWORD="$p1"
+}
+
+set_user_password() {
+  local username="$1"
+  local password_file="${2:-$OCSERV_PASSWD}"
+  [[ -f "$password_file" ]] || install -m 0600 /dev/null "$password_file"
+  printf '%s\n%s\n' "$CONFIRMED_PASSWORD" "$CONFIRMED_PASSWORD" |
+    ocpasswd -c "$password_file" "$username"
+  unset CONFIRMED_PASSWORD
+}
+
+add_user() {
+  local username="$1"
+  local password_file="${2:-$OCSERV_PASSWD}"
+  validate_username "$username" || die "invalid username: $username"
+  if user_exists "$username" "$password_file"; then
+    die "user already exists: $username"
+  fi
+  [[ -f "$password_file" ]] || install -m 0600 /dev/null "$password_file"
+  read_confirmed_password
+  set_user_password "$username" "$password_file"
+}
+
+delete_user() {
+  local username="$1"
+  local password_file="${2:-$OCSERV_PASSWD}"
+  validate_username "$username" || die "invalid username: $username"
+  user_exists "$username" "$password_file" || die "user not found: $username"
+  ocpasswd -c "$password_file" -d "$username"
+}
+
+ensure_initial_user() {
+  local password_file="$1"
+  [[ -f "$password_file" ]] || install -m 0600 /dev/null "$password_file"
+  if ! awk -F: 'NF { found=1 } END { exit !found }' "$password_file"; then
+    local username
+    read -r -p "Username for initial VPN user: " username
+    add_user "$username" "$password_file"
+  fi
+}
+
 usage() {
   printf '%s\n' \
     "Usage: ocserv-deploy.sh install" \
@@ -244,11 +310,33 @@ main() {
       usage
       return
       ;;
-    install|add-user|del-user)
+    install)
       require_root
       load_config
       validate_common_config
       die "unsupported command in configuration-only build: $1"
+      ;;
+    add-user)
+      require_root
+      load_config
+      validate_common_config
+      command -v ocpasswd >/dev/null 2>&1 || die "ocpasswd not found in PATH"
+      local username="${2:-}"
+      if [[ -z "$username" ]]; then
+        read -r -p "Username: " username
+      fi
+      add_user "$username"
+      ;;
+    del-user)
+      require_root
+      load_config
+      validate_common_config
+      command -v ocpasswd >/dev/null 2>&1 || die "ocpasswd not found in PATH"
+      local username="${2:-}"
+      if [[ -z "$username" ]]; then
+        read -r -p "Username: " username
+      fi
+      delete_user "$username"
       ;;
     *)
       usage >&2

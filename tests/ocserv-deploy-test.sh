@@ -503,4 +503,217 @@ run_test "generate selfsigned cleans up on failure" test_generate_selfsigned_cle
 run_test "selfsigned marks managed hook for deletion" test_selfsigned_marks_managed_hook_for_deletion
 run_test "selfsigned does not mark unmanaged hook" test_selfsigned_does_not_mark_unmanaged_hook
 run_test "certificate matches endpoint propagates genuine error" test_certificate_matches_endpoint_propagates_genuine_error
+
+# ==================== Task 3: Password-File User Management ====================
+
+_write_mock_ocpasswd() {
+  cat >"$TEST_ROOT/bin/ocpasswd" <<'MOCK_EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'ARGS: %s\n' "$*" >> "${TEST_ROOT}/ocpasswd-args.log"
+delete_mode=0
+password_file=""
+username=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c) password_file="$2"; shift 2 ;;
+    -d) delete_mode=1; shift ;;
+    *) username="$1"; shift ;;
+  esac
+done
+if ((delete_mode)); then
+  [[ -f "$password_file" ]] || { printf 'no password file\n' >&2; exit 1; }
+  awk -F: -v u="$username" '$1==u{f=1}END{exit !f}' "$password_file" ||
+    { printf 'user not found\n' >&2; exit 1; }
+  tmpf="$(mktemp "${password_file}.XXXXXX")"
+  awk -F: -v u="$username" '$1!=u' "$password_file" > "$tmpf"
+  mv "$tmpf" "$password_file"
+  exit 0
+fi
+IFS= read -r p1
+IFS= read -r p2
+[[ -n "$p1" ]] || { printf 'empty password\n' >&2; exit 1; }
+[[ "$p1" == "$p2" ]] || { printf 'passwords do not match\n' >&2; exit 1; }
+[[ -f "$password_file" ]] || touch "$password_file"
+tmpf="$(mktemp "${password_file}.XXXXXX")"
+awk -F: -v u="$username" '$1!=u' "$password_file" > "$tmpf"
+printf '%s:%s\n' "$username" "$p1" >> "$tmpf"
+mv "$tmpf" "$password_file"
+MOCK_EOF
+  chmod +x "$TEST_ROOT/bin/ocpasswd"
+}
+
+test_validate_username_valid_forms() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  assert_success validate_username "alice"
+  assert_success validate_username "alice.smith"
+  assert_success validate_username "alice_test"
+  assert_success validate_username "alice-2"
+}
+
+test_validate_username_rejects_empty() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  assert_failure validate_username ""
+}
+
+test_validate_username_rejects_leading_dash() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  assert_failure validate_username "-alice"
+}
+
+test_validate_username_rejects_whitespace() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  assert_failure validate_username "alice smith"
+}
+
+test_validate_username_rejects_slash() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  assert_failure validate_username "alice/smith"
+}
+
+test_validate_username_rejects_colon() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  assert_failure validate_username "alice:smith"
+}
+
+test_validate_username_rejects_over_64_chars() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  local long_name
+  long_name="$(python3 -c 'print("a"*65, end="")')"
+  assert_failure validate_username "$long_name"
+}
+
+test_read_confirmed_password_mismatch_rejected() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  local rc=0
+  (read_confirmed_password) < <(printf 'pass1\npass2\n') 2>/dev/null || rc=$?
+  ((rc != 0)) || fail "mismatched passwords must be rejected"
+}
+
+test_read_confirmed_password_empty_rejected() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  local rc=0
+  (read_confirmed_password) < <(printf '\n\n') 2>/dev/null || rc=$?
+  ((rc != 0)) || fail "empty password must be rejected"
+}
+
+test_add_user_no_password_in_args() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _write_mock_ocpasswd
+  source_deployer
+  local passwd_file="$TEST_ROOT/ocpasswd"
+  install -m 0600 /dev/null "$passwd_file"
+  export PATH="$TEST_ROOT/bin:$PATH"
+  add_user "alice" "$passwd_file" < <(printf 'secretpassword\nsecretpassword\n')
+  grep -q '^alice:' "$passwd_file" ||
+    fail "user alice was not added to password file"
+  if [[ -f "$TEST_ROOT/ocpasswd-args.log" ]] &&
+     grep -qF "secretpassword" "$TEST_ROOT/ocpasswd-args.log"; then
+    fail "password must not appear in ocpasswd arguments"
+  fi
+}
+
+test_add_user_duplicate_rejected() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _write_mock_ocpasswd
+  source_deployer
+  local passwd_file="$TEST_ROOT/ocpasswd"
+  install -m 0600 /dev/null "$passwd_file"
+  export PATH="$TEST_ROOT/bin:$PATH"
+  add_user "alice" "$passwd_file" < <(printf 'password1\npassword1\n')
+  local rc=0
+  (add_user "alice" "$passwd_file") < <(printf 'password1\npassword1\n') 2>/dev/null || rc=$?
+  ((rc != 0)) || fail "duplicate add_user must be rejected"
+}
+
+test_delete_user_existing() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _write_mock_ocpasswd
+  source_deployer
+  local passwd_file="$TEST_ROOT/ocpasswd"
+  install -m 0600 /dev/null "$passwd_file"
+  export PATH="$TEST_ROOT/bin:$PATH"
+  add_user "alice" "$passwd_file" < <(printf 'password1\npassword1\n')
+  assert_success delete_user "alice" "$passwd_file"
+  grep -q '^alice:' "$passwd_file" 2>/dev/null &&
+    fail "user alice should have been deleted" || true
+}
+
+test_delete_user_missing_rejected() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _write_mock_ocpasswd
+  source_deployer
+  local passwd_file="$TEST_ROOT/ocpasswd"
+  install -m 0600 /dev/null "$passwd_file"
+  export PATH="$TEST_ROOT/bin:$PATH"
+  assert_failure delete_user "alice" "$passwd_file"
+}
+
+test_ensure_initial_user_empty_prompts() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _write_mock_ocpasswd
+  source_deployer
+  local passwd_file="$TEST_ROOT/ocpasswd"
+  install -m 0600 /dev/null "$passwd_file"
+  export PATH="$TEST_ROOT/bin:$PATH"
+  ensure_initial_user "$passwd_file" < <(printf 'testuser\ntestpass\ntestpass\n')
+  grep -q '^testuser:' "$passwd_file" ||
+    fail "initial user was not added to empty password file"
+}
+
+test_ensure_initial_user_nonempty_skips() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _write_mock_ocpasswd
+  source_deployer
+  local passwd_file="$TEST_ROOT/ocpasswd"
+  install -m 0600 /dev/null "$passwd_file"
+  printf 'alice:hash\n' > "$passwd_file"
+  export PATH="$TEST_ROOT/bin:$PATH"
+  ensure_initial_user "$passwd_file" </dev/null
+  grep -q '^alice:' "$passwd_file" ||
+    fail "existing user should remain when file is non-empty"
+  local line_count
+  line_count="$(wc -l < "$passwd_file")"
+  ((line_count == 1)) || fail "no new user should be added when file is non-empty"
+}
+
+run_test "valid username forms" test_validate_username_valid_forms
+run_test "rejects empty username" test_validate_username_rejects_empty
+run_test "rejects leading dash" test_validate_username_rejects_leading_dash
+run_test "rejects whitespace in username" test_validate_username_rejects_whitespace
+run_test "rejects slash in username" test_validate_username_rejects_slash
+run_test "rejects colon in username" test_validate_username_rejects_colon
+run_test "rejects username over 64 chars" test_validate_username_rejects_over_64_chars
+run_test "password mismatch rejected" test_read_confirmed_password_mismatch_rejected
+run_test "empty password rejected" test_read_confirmed_password_empty_rejected
+run_test "add-user no password in args" test_add_user_no_password_in_args
+run_test "add-user duplicate rejected" test_add_user_duplicate_rejected
+run_test "delete existing user" test_delete_user_existing
+run_test "delete missing user rejected" test_delete_user_missing_rejected
+run_test "ensure initial user on empty file" test_ensure_initial_user_empty_prompts
+run_test "ensure initial user skips non-empty" test_ensure_initial_user_nonempty_skips
 finish_tests
