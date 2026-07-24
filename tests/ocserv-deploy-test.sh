@@ -1619,4 +1619,670 @@ run_test "lock file confined to OCSERV_DEPLOY_ROOT, real host lock untouched" te
 run_test "lock file matches production path when ROOT_PREFIX is empty" test_render_network_helper_lock_file_matches_production_path_when_root_prefix_empty
 run_test "systemd drop-in contents" test_render_systemd_dropin_contents
 
+# ==================== Task 6: Transactional Installer and Service Verification ====================
+
+_write_os_release() {
+  local id="$1" version="$2"
+  cat >"$TEST_ROOT/os-release" <<EOF
+ID=${id}
+VERSION_ID="${version}"
+EOF
+}
+
+# Writes the full set of system-command mocks used by the orchestration
+# tests. Every real system command (apt-get, dpkg, systemctl, ss, ip, nft,
+# sysctl, ocserv, ocpasswd) is intercepted under $TEST_ROOT/bin so no test
+# ever touches real packages, services, sockets, or the host firewall.
+_write_orch_mocks() {
+  cat >"$TEST_ROOT/bin/apt-get" <<'MOCK_EOF'
+#!/usr/bin/env bash
+printf 'ARGS: %s\n' "$*" >> "$TEST_ROOT/apt-get-args.log"
+if [[ "$1" == "install" && -f "$TEST_ROOT/ctl/apt_creates_default" ]]; then
+  install -d -m 0755 "$OCSERV_DEPLOY_ROOT/etc/ocserv"
+  printf 'stock package default\n' > "$OCSERV_DEPLOY_ROOT/etc/ocserv/ocserv.conf"
+fi
+exit 0
+MOCK_EOF
+
+  cat >"$TEST_ROOT/bin/dpkg" <<'MOCK_EOF'
+#!/usr/bin/env bash
+[[ "$1" == "--print-architecture" ]] && { printf '%s\n' "${MOCK_ARCH:-amd64}"; exit 0; }
+exit 0
+MOCK_EOF
+
+  cat >"$TEST_ROOT/bin/systemctl" <<'MOCK_EOF'
+#!/usr/bin/env bash
+printf 'ARGS: %s\n' "$*" >> "$TEST_ROOT/systemctl-args.log"
+ctl="$TEST_ROOT/ctl"
+mkdir -p "$ctl"
+case "$1" in
+  is-active) [[ -f "$ctl/is_active" ]] && exit 0 || exit 1 ;;
+  is-enabled) [[ -f "$ctl/is_enabled" ]] && exit 0 || exit 1 ;;
+  enable) touch "$ctl/is_enabled"; exit 0 ;;
+  disable) rm -f "$ctl/is_enabled"; exit 0 ;;
+  restart) [[ -f "$ctl/restart_fail" ]] && exit 1; exit 0 ;;
+  stop) exit 0 ;;
+  daemon-reload) exit 0 ;;
+  *) exit 0 ;;
+esac
+MOCK_EOF
+
+  cat >"$TEST_ROOT/bin/ss" <<'MOCK_EOF'
+#!/usr/bin/env bash
+printf 'ARGS: %s\n' "$*" >> "$TEST_ROOT/ss-args.log"
+flags="$2"
+if [[ "$flags" == *p* ]]; then
+  # Port-availability probe (-ltnp / -lunp): report the port free.
+  exit 0
+fi
+ctl="$TEST_ROOT/ctl"
+if [[ "$flags" == *t* && -f "$ctl/no_tcp" ]]; then exit 0; fi
+if [[ "$flags" == *u* && -f "$ctl/no_udp" ]]; then exit 0; fi
+printf 'LISTEN 0 128 0.0.0.0:%s 0.0.0.0:*\n' "${OCSERV_PORT:-8443}"
+exit 0
+MOCK_EOF
+
+  cat >"$TEST_ROOT/bin/ip" <<'MOCK_EOF'
+#!/usr/bin/env bash
+args="$*"
+case "$args" in
+  *"route get"*)
+    printf '1.1.1.1 via 172.16.0.1 dev eth0 src 172.16.0.4 uid 0\n    cache\n' ;;
+  *"route show"*)
+    printf 'default via 172.16.0.1 dev eth0 proto dhcp src 172.16.0.4 metric 100\n'
+    printf '172.16.0.0/24 dev eth0 proto kernel scope link src 172.16.0.4 metric 100\n' ;;
+  *) : ;;
+esac
+exit 0
+MOCK_EOF
+
+  cat >"$TEST_ROOT/bin/ocserv" <<'MOCK_EOF'
+#!/usr/bin/env bash
+printf 'ARGS: %s\n' "$*" >> "$TEST_ROOT/ocserv-args.log"
+[[ -f "$TEST_ROOT/ctl/testconfig_fail" ]] && exit 1
+exit 0
+MOCK_EOF
+
+  _write_mock_sysctl
+  _write_mock_nft
+  _write_mock_ocpasswd
+  chmod +x "$TEST_ROOT/bin/"*
+}
+
+# Sets up a fully validated config plus every system-command mock. The
+# optional second argument injects extra config lines (e.g. Let's Encrypt
+# fields). Leaves PATH pointing at the mock bin and OS_RELEASE_FILE at a
+# supported Ubuntu 24.04 fixture.
+_orchestration_fixture() {
+  local cert_mode="${1:-selfsigned}" extra="${2:-}"
+  write_config "
+OCSERV_ENDPOINT=\"vpn.example.com\"
+OCSERV_PORT=\"8443\"
+OCSERV_IPV4_NETWORK=\"10.66.0.0/24\"
+OCSERV_DNS=(\"8.8.4.4\")
+OCSERV_CERT_MODE=\"${cert_mode}\"
+${extra}
+"
+  source_deployer
+  load_config
+  validate_common_config
+  _write_orch_mocks
+  _write_os_release ubuntu 24.04
+  mkdir -p "$TEST_ROOT/ctl"
+  OS_RELEASE_FILE="$TEST_ROOT/os-release"
+  export PATH="$TEST_ROOT/bin:$PATH"
+}
+
+_seed_prior_managed_files() {
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf '%s\nPRIOR-CONF\n' "$MANAGED_MARKER" >"$OCSERV_CONF"
+  chmod 0600 "$OCSERV_CONF"
+  install -d -m 0755 "$(dirname "$NETWORK_HELPER")"
+  printf '%s\nPRIOR-HELPER\n' "$MANAGED_MARKER" >"$NETWORK_HELPER"
+  chmod 0755 "$NETWORK_HELPER"
+  install -d -m 0755 "$(dirname "$SYSTEMD_DROPIN")"
+  printf '%s\nPRIOR-DROPIN\n' "$MANAGED_MARKER" >"$SYSTEMD_DROPIN"
+  chmod 0644 "$SYSTEMD_DROPIN"
+}
+
+# ---------- platform and dependency installation ----------
+
+test_install_dependencies_supported_platform_succeeds() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  assert_success install_dependencies
+}
+
+test_install_dependencies_installs_exact_packages() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  install_dependencies
+  local ok=0
+  grep -qFx 'ARGS: update' "$TEST_ROOT/apt-get-args.log" ||
+    { fail "apt-get update must run"; ok=1; }
+  grep -qFx 'ARGS: install -y --no-install-recommends ocserv nftables openssl iproute2 util-linux' \
+    "$TEST_ROOT/apt-get-args.log" ||
+    { fail "dependencies must be exactly ocserv nftables openssl iproute2 util-linux"; ok=1; }
+  return "$ok"
+}
+
+test_install_dependencies_unsupported_id_fails_before_apt() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _write_os_release debian 12
+  assert_failure install_dependencies
+  [[ ! -f "$TEST_ROOT/apt-get-args.log" ]] ||
+    fail "apt-get must not run for an unsupported OS ID"
+}
+
+test_install_dependencies_unsupported_version_fails_before_apt() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _write_os_release ubuntu 20.04
+  assert_failure install_dependencies
+  [[ ! -f "$TEST_ROOT/apt-get-args.log" ]] ||
+    fail "apt-get must not run for an unsupported Ubuntu version"
+}
+
+test_install_dependencies_unsupported_arch_fails_before_apt() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  export MOCK_ARCH="armhf"
+  local rc=0
+  assert_failure install_dependencies || rc=1
+  unset MOCK_ARCH
+  [[ ! -f "$TEST_ROOT/apt-get-args.log" ]] ||
+    { fail "apt-get must not run for an unsupported architecture"; rc=1; }
+  return "$rc"
+}
+
+# ---------- install lock ----------
+
+test_install_lock_rejects_concurrent_runs() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  install -d -m 0755 "$(dirname "$INSTALL_LOCK")"
+  exec 8>"$INSTALL_LOCK"
+  flock -n 8 || { fail "test harness could not acquire the install lock"; return 1; }
+  local rc=0
+  ( main install ) </dev/null >/dev/null 2>&1 || rc=$?
+  exec 8>&-
+  ((rc != 0)) || fail "a concurrent install must be rejected while the lock is held"
+}
+
+# ---------- staging, validation, and atomic replacement ----------
+
+test_first_install_replaces_package_default() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  touch "$TEST_ROOT/ctl/apt_creates_default"
+  touch "$TEST_ROOT/ctl/is_active"
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 ||
+    { fail "install must succeed and replace the package default"; return 1; }
+  grep -qF "$MANAGED_MARKER" "$OCSERV_CONF" ||
+    fail "the package-created default config must be replaced by the managed config"
+}
+
+test_install_validates_staged_config_before_replacement() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  touch "$TEST_ROOT/ctl/is_active"
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 ||
+    { fail "install must succeed"; return 1; }
+  grep -qE 'ARGS: -c .*/stage/ocserv\.conf --test-config' "$TEST_ROOT/ocserv-args.log" ||
+    fail "ocserv --test-config must validate the STAGED config, not the live file"
+}
+
+test_install_empty_db_creates_initial_user() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  touch "$TEST_ROOT/ctl/is_active"
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 ||
+    { fail "install must succeed and create the initial user"; return 1; }
+  grep -q '^vpnuser:' "$OCSERV_PASSWD" ||
+    fail "the initial user must be created and present in the live password database"
+}
+
+test_install_nonempty_db_preserved() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  install -d -m 0755 "$(dirname "$OCSERV_PASSWD")"
+  printf 'alice:hash\n' >"$OCSERV_PASSWD"
+  chmod 0600 "$OCSERV_PASSWD"
+  touch "$TEST_ROOT/ctl/is_active"
+  ( main install ) </dev/null >/dev/null 2>&1 ||
+    { fail "install must succeed and preserve the existing database"; return 1; }
+  local ok=0
+  grep -q '^alice:' "$OCSERV_PASSWD" ||
+    { fail "the existing VPN user must be preserved"; ok=1; }
+  local lines
+  lines="$(wc -l <"$OCSERV_PASSWD")"
+  ((lines == 1)) ||
+    { fail "no additional user must be created for a non-empty database"; ok=1; }
+  return "$ok"
+}
+
+# ---------- service activation and verification ----------
+
+test_activate_service_order() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  activate_service
+  local reload enable restart
+  reload="$(grep -nFx 'ARGS: daemon-reload' "$TEST_ROOT/systemctl-args.log" | head -1 | cut -d: -f1)"
+  enable="$(grep -nFx 'ARGS: enable ocserv.service' "$TEST_ROOT/systemctl-args.log" | head -1 | cut -d: -f1)"
+  restart="$(grep -nFx 'ARGS: restart ocserv.service' "$TEST_ROOT/systemctl-args.log" | head -1 | cut -d: -f1)"
+  local ok=0
+  [[ -n "$reload" && -n "$enable" && -n "$restart" ]] ||
+    { fail "daemon-reload, enable, and restart must all be invoked"; ok=1; }
+  if [[ -n "$reload" && -n "$enable" && -n "$restart" ]] &&
+     ! ((reload < enable && enable < restart)); then
+    fail "activation order must be daemon-reload, enable, then restart"
+    ok=1
+  fi
+  return "$ok"
+}
+
+test_verify_service_success() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  touch "$TEST_ROOT/ctl/is_active"
+  assert_success verify_service
+}
+
+test_verify_service_requires_active() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  assert_failure verify_service
+}
+
+test_verify_service_requires_tcp_listener() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  touch "$TEST_ROOT/ctl/is_active"
+  touch "$TEST_ROOT/ctl/no_tcp"
+  assert_failure verify_service
+}
+
+test_verify_service_requires_udp_listener() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  touch "$TEST_ROOT/ctl/is_active"
+  touch "$TEST_ROOT/ctl/no_udp"
+  assert_failure verify_service
+}
+
+# ---------- rollback on failure ----------
+
+_assert_prior_files_restored() {
+  local ok=0
+  grep -qFx 'PRIOR-CONF' "$OCSERV_CONF" 2>/dev/null ||
+    { fail "prior ocserv.conf must be restored on rollback"; ok=1; }
+  grep -qFx 'PRIOR-HELPER' "$NETWORK_HELPER" 2>/dev/null ||
+    { fail "prior network helper must be restored on rollback"; ok=1; }
+  grep -qFx 'PRIOR-DROPIN' "$SYSTEMD_DROPIN" 2>/dev/null ||
+    { fail "prior systemd drop-in must be restored on rollback"; ok=1; }
+  [[ ! -e "$SELF_SIGNED_CERT" ]] ||
+    { fail "a newly created self-signed cert must be removed on rollback"; ok=1; }
+  [[ ! -e "$SELF_SIGNED_KEY" ]] ||
+    { fail "a newly created self-signed key must be removed on rollback"; ok=1; }
+  return "$ok"
+}
+
+test_rollback_on_config_check_failure() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _seed_prior_managed_files
+  touch "$TEST_ROOT/ctl/testconfig_fail"
+  local rc=0
+  ( install_server ) </dev/null >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "install_server must fail when the config check fails"; ok=1; }
+  _assert_prior_files_restored || ok=1
+  return "$ok"
+}
+
+test_rollback_on_nft_check_failure() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _seed_prior_managed_files
+  _seed_unowned_table
+  local rc=0
+  ( install_server ) </dev/null >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "install_server must fail when the nft check fails"; ok=1; }
+  _assert_prior_files_restored || ok=1
+  return "$ok"
+}
+
+test_rollback_on_user_creation_failure() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _seed_prior_managed_files
+  cat >"$TEST_ROOT/bin/ocpasswd" <<'MOCK_EOF'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 1
+MOCK_EOF
+  chmod +x "$TEST_ROOT/bin/ocpasswd"
+  local rc=0
+  ( install_server ) < <(printf 'newuser\nsecret\nsecret\n') >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "install_server must fail when initial-user creation fails"; ok=1; }
+  _assert_prior_files_restored || ok=1
+  [[ ! -e "$OCSERV_PASSWD" ]] ||
+    { fail "no live password database must be created when user creation fails"; ok=1; }
+  return "$ok"
+}
+
+test_rollback_on_restart_failure() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _seed_prior_managed_files
+  install -d -m 0755 "$(dirname "$OCSERV_PASSWD")"
+  printf 'alice:hash\n' >"$OCSERV_PASSWD"
+  chmod 0600 "$OCSERV_PASSWD"
+  touch "$TEST_ROOT/ctl/restart_fail"
+  local rc=0
+  ( install_server ) </dev/null >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "install_server must fail when restart fails"; ok=1; }
+  _assert_prior_files_restored || ok=1
+  grep -q '^alice:' "$OCSERV_PASSWD" ||
+    { fail "the prior password database must be restored after a restart failure"; ok=1; }
+  return "$ok"
+}
+
+test_rollback_on_inactive_service() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _seed_prior_managed_files
+  install -d -m 0755 "$(dirname "$OCSERV_PASSWD")"
+  printf 'alice:hash\n' >"$OCSERV_PASSWD"
+  chmod 0600 "$OCSERV_PASSWD"
+  # restart "succeeds" but the service never becomes active (no is_active).
+  local rc=0
+  ( install_server ) </dev/null >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "install_server must fail when the service is not active"; ok=1; }
+  _assert_prior_files_restored || ok=1
+  return "$ok"
+}
+
+test_rollback_on_missing_listener() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _seed_prior_managed_files
+  install -d -m 0755 "$(dirname "$OCSERV_PASSWD")"
+  printf 'alice:hash\n' >"$OCSERV_PASSWD"
+  chmod 0600 "$OCSERV_PASSWD"
+  touch "$TEST_ROOT/ctl/is_active"
+  touch "$TEST_ROOT/ctl/no_udp"
+  local rc=0
+  ( install_server ) </dev/null >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "install_server must fail when a listener is missing"; ok=1; }
+  _assert_prior_files_restored || ok=1
+  return "$ok"
+}
+
+test_rollback_on_int_signal() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _seed_prior_managed_files
+  local rc=0
+  (
+    set -Eeuo pipefail
+    begin_transaction
+    snapshot_target "$OCSERV_CONF"
+    snapshot_target "$SELF_SIGNED_CERT"
+    install -d -m 0700 "$(dirname "$SELF_SIGNED_CERT")"
+    printf 'NEW-CERT\n' >"$SELF_SIGNED_CERT"
+    kill -INT "$BASHPID"
+    sleep 5
+  ) >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc == 130)) || { fail "INT must trigger rollback and exit 130 (got $rc)"; ok=1; }
+  grep -qFx 'PRIOR-CONF' "$OCSERV_CONF" ||
+    { fail "INT rollback must restore the prior config"; ok=1; }
+  [[ ! -e "$SELF_SIGNED_CERT" ]] ||
+    { fail "INT rollback must remove a newly created file"; ok=1; }
+  return "$ok"
+}
+
+test_rollback_on_term_signal() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _seed_prior_managed_files
+  local rc=0
+  (
+    set -Eeuo pipefail
+    begin_transaction
+    snapshot_target "$OCSERV_CONF"
+    snapshot_target "$SELF_SIGNED_CERT"
+    install -d -m 0700 "$(dirname "$SELF_SIGNED_CERT")"
+    printf 'NEW-CERT\n' >"$SELF_SIGNED_CERT"
+    kill -TERM "$BASHPID"
+    sleep 5
+  ) >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc == 143)) || { fail "TERM must trigger rollback and exit 143 (got $rc)"; ok=1; }
+  grep -qFx 'PRIOR-CONF' "$OCSERV_CONF" ||
+    { fail "TERM rollback must restore the prior config"; ok=1; }
+  [[ ! -e "$SELF_SIGNED_CERT" ]] ||
+    { fail "TERM rollback must remove a newly created file"; ok=1; }
+  return "$ok"
+}
+
+test_rollback_restores_inactive_disabled_state() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _seed_prior_managed_files
+  # Prior state: service inactive and disabled (no is_active/is_enabled).
+  touch "$TEST_ROOT/ctl/testconfig_fail"
+  local rc=0
+  ( install_server ) </dev/null >/dev/null 2>&1 || rc=$?
+  ((rc != 0)) || { fail "install_server must fail"; return 1; }
+  local ok=0
+  grep -qFx 'ARGS: disable ocserv.service' "$TEST_ROOT/systemctl-args.log" ||
+    { fail "rollback must restore the previously disabled state"; ok=1; }
+  grep -qFx 'ARGS: stop ocserv.service' "$TEST_ROOT/systemctl-args.log" ||
+    { fail "rollback must stop the previously inactive service"; ok=1; }
+  return "$ok"
+}
+
+test_rollback_restores_active_enabled_state() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _seed_prior_managed_files
+  # Prior state: service active and enabled.
+  touch "$TEST_ROOT/ctl/is_active"
+  touch "$TEST_ROOT/ctl/is_enabled"
+  touch "$TEST_ROOT/ctl/testconfig_fail"
+  local rc=0
+  ( install_server ) </dev/null >/dev/null 2>&1 || rc=$?
+  ((rc != 0)) || { fail "install_server must fail"; return 1; }
+  local ok=0
+  grep -qFx 'ARGS: enable ocserv.service' "$TEST_ROOT/systemctl-args.log" ||
+    { fail "rollback must restore the previously enabled state"; ok=1; }
+  grep -qFx 'ARGS: restart ocserv.service' "$TEST_ROOT/systemctl-args.log" ||
+    { fail "rollback must restart the previously active service"; ok=1; }
+  return "$ok"
+}
+
+# ---------- certificate hook behaviour ----------
+
+test_selfsigned_install_creates_no_hook() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  touch "$TEST_ROOT/ctl/is_active"
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 ||
+    { fail "self-signed install must succeed"; return 1; }
+  [[ ! -e "$CERT_HOOK" ]] ||
+    fail "self-signed install must not create a Certbot deploy hook"
+}
+
+test_letsencrypt_install_creates_managed_hook() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture letsencrypt \
+    "$(printf 'CERT_NAME="vpn.example.com"\nLE_CONFIG_DIR="%s/etc/letsencrypt"' "$OCSERV_DEPLOY_ROOT")"
+  local live="$OCSERV_DEPLOY_ROOT/etc/letsencrypt/live/vpn.example.com"
+  install -d -m 0755 "$live"
+  _generate_test_cert vpn.example.com "$live/fullchain.pem" "$live/privkey.pem"
+  touch "$TEST_ROOT/ctl/is_active"
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 ||
+    { fail "letsencrypt install must succeed"; return 1; }
+  local ok=0
+  [[ -f "$CERT_HOOK" ]] || { fail "letsencrypt install must create the deploy hook"; ok=1; }
+  [[ -x "$CERT_HOOK" ]] || { fail "the deploy hook must be executable"; ok=1; }
+  grep -qF "$MANAGED_MARKER" "$CERT_HOOK" 2>/dev/null ||
+    { fail "the deploy hook must carry the management marker"; ok=1; }
+  return "$ok"
+}
+
+test_switch_le_to_selfsigned_removes_managed_hook() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  install -d -m 0755 "$(dirname "$CERT_HOOK")"
+  printf '%s\n# stale managed hook\n' "$MANAGED_MARKER" >"$CERT_HOOK"
+  chmod +x "$CERT_HOOK"
+  touch "$TEST_ROOT/ctl/is_active"
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 ||
+    { fail "self-signed install must succeed"; return 1; }
+  [[ ! -e "$CERT_HOOK" ]] ||
+    fail "switching to self-signed must remove the managed Let's Encrypt hook"
+}
+
+test_selfsigned_leaves_unmanaged_hook() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  install -d -m 0755 "$(dirname "$CERT_HOOK")"
+  printf 'UNMANAGED-HOOK\n' >"$CERT_HOOK"
+  chmod +x "$CERT_HOOK"
+  touch "$TEST_ROOT/ctl/is_active"
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 ||
+    { fail "self-signed install must succeed"; return 1; }
+  local ok=0
+  [[ -f "$CERT_HOOK" ]] || { fail "an unmanaged hook must never be deleted"; ok=1; }
+  grep -qFx 'UNMANAGED-HOOK' "$CERT_HOOK" 2>/dev/null ||
+    { fail "an unmanaged hook must be left byte-for-byte untouched"; ok=1; }
+  return "$ok"
+}
+
+# ---------- unknown collision safety ----------
+
+test_install_refuses_unmanaged_helper() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  install -d -m 0755 "$(dirname "$NETWORK_HELPER")"
+  printf 'UNMANAGED-HELPER\n' >"$NETWORK_HELPER"
+  chmod 0755 "$NETWORK_HELPER"
+  local rc=0
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "install must refuse an unmanaged network helper"; ok=1; }
+  grep -qFx 'UNMANAGED-HELPER' "$NETWORK_HELPER" 2>/dev/null ||
+    { fail "the unmanaged network helper must be left untouched"; ok=1; }
+  return "$ok"
+}
+
+test_install_refuses_unmanaged_dropin() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  install -d -m 0755 "$(dirname "$SYSTEMD_DROPIN")"
+  printf 'UNMANAGED-DROPIN\n' >"$SYSTEMD_DROPIN"
+  chmod 0644 "$SYSTEMD_DROPIN"
+  local rc=0
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "install must refuse an unmanaged systemd drop-in"; ok=1; }
+  grep -qFx 'UNMANAGED-DROPIN' "$SYSTEMD_DROPIN" 2>/dev/null ||
+    { fail "the unmanaged systemd drop-in must be left untouched"; ok=1; }
+  return "$ok"
+}
+
+test_install_refuses_unmanaged_hook_in_letsencrypt_mode() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture letsencrypt \
+    "$(printf 'CERT_NAME="vpn.example.com"\nLE_CONFIG_DIR="%s/etc/letsencrypt"' "$OCSERV_DEPLOY_ROOT")"
+  local live="$OCSERV_DEPLOY_ROOT/etc/letsencrypt/live/vpn.example.com"
+  install -d -m 0755 "$live"
+  _generate_test_cert vpn.example.com "$live/fullchain.pem" "$live/privkey.pem"
+  install -d -m 0755 "$(dirname "$CERT_HOOK")"
+  printf 'UNMANAGED-HOOK\n' >"$CERT_HOOK"
+  chmod +x "$CERT_HOOK"
+  local rc=0
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "letsencrypt install must refuse an unmanaged hook"; ok=1; }
+  grep -qFx 'UNMANAGED-HOOK' "$CERT_HOOK" 2>/dev/null ||
+    { fail "the unmanaged hook must be left untouched"; ok=1; }
+  return "$ok"
+}
+
+run_test "supported platform succeeds" test_install_dependencies_supported_platform_succeeds
+run_test "dependencies are the exact package set" test_install_dependencies_installs_exact_packages
+run_test "unsupported OS ID fails before apt" test_install_dependencies_unsupported_id_fails_before_apt
+run_test "unsupported Ubuntu version fails before apt" test_install_dependencies_unsupported_version_fails_before_apt
+run_test "unsupported architecture fails before apt" test_install_dependencies_unsupported_arch_fails_before_apt
+run_test "install lock rejects concurrent runs" test_install_lock_rejects_concurrent_runs
+run_test "first install replaces package default" test_first_install_replaces_package_default
+run_test "config validated in staging before replacement" test_install_validates_staged_config_before_replacement
+run_test "empty database creates initial user" test_install_empty_db_creates_initial_user
+run_test "non-empty database preserved" test_install_nonempty_db_preserved
+run_test "activation order is reload/enable/restart" test_activate_service_order
+run_test "verify succeeds when active with listeners" test_verify_service_success
+run_test "verify requires active service" test_verify_service_requires_active
+run_test "verify requires TCP listener" test_verify_service_requires_tcp_listener
+run_test "verify requires UDP listener" test_verify_service_requires_udp_listener
+run_test "config-check failure rolls back" test_rollback_on_config_check_failure
+run_test "nft-check failure rolls back" test_rollback_on_nft_check_failure
+run_test "user-creation failure rolls back" test_rollback_on_user_creation_failure
+run_test "restart failure rolls back" test_rollback_on_restart_failure
+run_test "inactive service rolls back" test_rollback_on_inactive_service
+run_test "missing listener rolls back" test_rollback_on_missing_listener
+run_test "INT triggers rollback" test_rollback_on_int_signal
+run_test "TERM triggers rollback" test_rollback_on_term_signal
+run_test "rollback restores inactive/disabled state" test_rollback_restores_inactive_disabled_state
+run_test "rollback restores active/enabled state" test_rollback_restores_active_enabled_state
+run_test "self-signed creates no hook" test_selfsigned_install_creates_no_hook
+run_test "letsencrypt creates managed hook" test_letsencrypt_install_creates_managed_hook
+run_test "switch LE to selfsigned removes managed hook" test_switch_le_to_selfsigned_removes_managed_hook
+run_test "selfsigned leaves unmanaged hook" test_selfsigned_leaves_unmanaged_hook
+run_test "install refuses unmanaged helper" test_install_refuses_unmanaged_helper
+run_test "install refuses unmanaged drop-in" test_install_refuses_unmanaged_dropin
+run_test "letsencrypt refuses unmanaged hook" test_install_refuses_unmanaged_hook_in_letsencrypt_mode
+
 finish_tests

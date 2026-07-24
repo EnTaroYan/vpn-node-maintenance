@@ -23,12 +23,37 @@ SERVER_KEY_FILE=""
 CERT_HOOK_DELETE=""
 CONF_EXISTED_BEFORE_INSTALL=0
 
+# Overridable so tests can point platform detection at a fixture file.
+OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
+
+# Root-only transaction workspace under /run (prefixed for test isolation).
+readonly TRANSACTION_DIR_ROOT="${ROOT_PREFIX}/run/ocserv-deploy"
+TXN_DIR=""
+STAGED_OCSERV_CONF=""
+STAGED_OCSERV_PASSWD=""
+STAGED_NETWORK_HELPER=""
+STAGED_SYSTEMD_DROPIN=""
+STAGED_CERT_HOOK=""
+STAGED_SELF_SIGNED_CERT=""
+STAGED_SELF_SIGNED_KEY=""
+
+TRANSACTION_ACTIVE=0
+ROLLBACK_RUNNING=0
+SERVICE_WAS_ACTIVE=0
+SERVICE_WAS_ENABLED=0
+declare -ga SNAPSHOT_TARGETS=()
+declare -gA SNAPSHOT_EXISTED=()
+declare -gA SNAPSHOT_MODE=()
+
 log() {
   printf '%s [ocserv-deploy] %s\n' "$(date --iso-8601=seconds)" "$*"
 }
 
 die() {
   log "ERROR: $*" >&2
+  if ((TRANSACTION_ACTIVE)); then
+    rollback_transaction 1
+  fi
   exit 1
 }
 
@@ -616,6 +641,276 @@ ensure_initial_user() {
   fi
 }
 
+# ==================== Platform and dependencies ====================
+
+_os_release_field() {
+  local key="$1" line
+  line="$(grep -E "^${key}=" "$OS_RELEASE_FILE" 2>/dev/null | tail -n1)" || true
+  line="${line#*=}"
+  line="${line%\"}"
+  line="${line#\"}"
+  printf '%s' "$line"
+}
+
+check_supported_platform() {
+  [[ -r "$OS_RELEASE_FILE" ]] || die "cannot read OS release file: $OS_RELEASE_FILE"
+  local os_id os_version arch
+  os_id="$(_os_release_field ID)"
+  os_version="$(_os_release_field VERSION_ID)"
+  [[ "$os_id" == "ubuntu" ]] ||
+    die "unsupported OS: ${os_id:-unknown} (requires Ubuntu)"
+  case "$os_version" in
+    22.04|24.04) ;;
+    *) die "unsupported Ubuntu version: ${os_version:-unknown} (requires 22.04 or 24.04)" ;;
+  esac
+  arch="$(dpkg --print-architecture)"
+  case "$arch" in
+    amd64|arm64) ;;
+    *) die "unsupported architecture: ${arch:-unknown} (requires amd64 or arm64)" ;;
+  esac
+}
+
+# Packages remain installed even if a later transactional step fails; the
+# rollback contract covers configuration state, not the package database.
+install_dependencies() {
+  check_supported_platform
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ocserv nftables openssl iproute2 util-linux
+}
+
+# ==================== Transaction and rollback ====================
+
+_snapshot_key() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'
+}
+
+# Records existence and mode for one exact target path, backing up any
+# existing file so rollback can restore it byte-for-byte.
+snapshot_target() {
+  local path="$1" slug
+  slug="$(_snapshot_key "$path")"
+  SNAPSHOT_TARGETS+=("$path")
+  if [[ -e "$path" ]]; then
+    SNAPSHOT_EXISTED["$path"]=1
+    SNAPSHOT_MODE["$path"]="$(stat -c '%a' "$path")"
+    cp -a -- "$path" "${TXN_DIR}/backup/${slug}"
+  else
+    SNAPSHOT_EXISTED["$path"]=0
+  fi
+}
+
+begin_transaction() {
+  install -d -m 0700 "$TRANSACTION_DIR_ROOT"
+  TXN_DIR="$(mktemp -d "${TRANSACTION_DIR_ROOT}/txn.XXXXXX")"
+  install -d -m 0700 "${TXN_DIR}/backup" "${TXN_DIR}/stage"
+  STAGED_OCSERV_CONF="${TXN_DIR}/stage/ocserv.conf"
+  STAGED_OCSERV_PASSWD="${TXN_DIR}/stage/ocpasswd"
+  STAGED_NETWORK_HELPER="${TXN_DIR}/stage/ocserv-network"
+  STAGED_SYSTEMD_DROPIN="${TXN_DIR}/stage/10-network.conf"
+  STAGED_CERT_HOOK="${TXN_DIR}/stage/20-ocserv"
+  STAGED_SELF_SIGNED_CERT="${TXN_DIR}/stage/selfsigned-cert.pem"
+  STAGED_SELF_SIGNED_KEY="${TXN_DIR}/stage/selfsigned-key.pem"
+  SNAPSHOT_TARGETS=()
+  SNAPSHOT_EXISTED=()
+  SNAPSHOT_MODE=()
+  if systemctl is-active --quiet ocserv.service; then
+    SERVICE_WAS_ACTIVE=1
+  else
+    SERVICE_WAS_ACTIVE=0
+  fi
+  if systemctl is-enabled --quiet ocserv.service 2>/dev/null; then
+    SERVICE_WAS_ENABLED=1
+  else
+    SERVICE_WAS_ENABLED=0
+  fi
+  ROLLBACK_RUNNING=0
+  TRANSACTION_ACTIVE=1
+  trap 'rollback_transaction $?' ERR
+  trap 'rollback_transaction 130' INT
+  trap 'rollback_transaction 143' TERM
+}
+
+# Idempotent, trap-guarded rollback. Restores every snapshotted target to
+# its prior state (or removes it if it did not exist before), reloads
+# systemd, and restores the previous enabled/active service state.
+rollback_transaction() {
+  local exit_code="${1:-1}"
+  if ((ROLLBACK_RUNNING)); then
+    return 0
+  fi
+  ROLLBACK_RUNNING=1
+  trap - ERR INT TERM
+  set +e
+  if ((TRANSACTION_ACTIVE)); then
+    log "rolling back transaction"
+    local path slug
+    for path in "${SNAPSHOT_TARGETS[@]}"; do
+      slug="$(_snapshot_key "$path")"
+      if [[ "${SNAPSHOT_EXISTED[$path]:-0}" == "1" ]]; then
+        install -D -m "${SNAPSHOT_MODE[$path]}" "${TXN_DIR}/backup/${slug}" "$path"
+      else
+        rm -f -- "$path"
+      fi
+    done
+    systemctl daemon-reload
+    if ((SERVICE_WAS_ENABLED)); then
+      systemctl enable ocserv.service
+    else
+      systemctl disable ocserv.service
+    fi
+    if ((SERVICE_WAS_ACTIVE)); then
+      systemctl restart ocserv.service
+    else
+      systemctl stop ocserv.service
+    fi
+    TRANSACTION_ACTIVE=0
+  fi
+  [[ -n "$TXN_DIR" ]] && rm -rf -- "$TXN_DIR"
+  exit "$exit_code"
+}
+
+commit_transaction() {
+  trap - ERR INT TERM
+  TRANSACTION_ACTIVE=0
+  [[ -n "$TXN_DIR" ]] && rm -rf -- "$TXN_DIR"
+}
+
+# ==================== Staging and atomic install ====================
+
+# Refuses to touch a target that exists but is not owned by this tool, so
+# unknown helper/drop-in/hook collisions are never overwritten or deleted.
+guard_managed_or_absent() {
+  local path="$1"
+  [[ -e "$path" ]] || return 0
+  is_managed_file "$path" ||
+    die "refusing to overwrite unmanaged file: $path"
+}
+
+check_managed_targets() {
+  guard_managed_or_absent "$NETWORK_HELPER"
+  guard_managed_or_absent "$SYSTEMD_DROPIN"
+  if [[ "$OCSERV_CERT_MODE" == "letsencrypt" ]]; then
+    guard_managed_or_absent "$CERT_HOOK"
+  fi
+}
+
+# Renders every managed file into the transaction staging directory and
+# copies (or creates) the password database there. Nothing here becomes
+# live; install_staged_files performs the atomic replacement later.
+stage_managed_files() {
+  render_ocserv_config "$STAGED_OCSERV_CONF"
+  chmod 0600 "$STAGED_OCSERV_CONF"
+  render_network_helper "$STAGED_NETWORK_HELPER"
+  render_systemd_dropin "$STAGED_SYSTEMD_DROPIN"
+  if [[ -f "$OCSERV_PASSWD" ]]; then
+    install -m 0600 "$OCSERV_PASSWD" "$STAGED_OCSERV_PASSWD"
+  else
+    install -m 0600 /dev/null "$STAGED_OCSERV_PASSWD"
+  fi
+  if [[ "$OCSERV_CERT_MODE" == "letsencrypt" ]]; then
+    render_certbot_hook "$STAGED_CERT_HOOK"
+  else
+    install -m 0600 "$SERVER_KEY_FILE" "$STAGED_SELF_SIGNED_KEY"
+    install -m 0644 "$SERVER_CERT_FILE" "$STAGED_SELF_SIGNED_CERT"
+  fi
+}
+
+validate_staged_files() {
+  test_ocserv_config "$STAGED_OCSERV_CONF"
+  "$STAGED_NETWORK_HELPER" check
+}
+
+# Atomically installs one file: stage a same-filesystem temporary target
+# with the final mode, then rename it over the destination.
+_atomic_install_file() {
+  local mode="$1" src="$2" dest="$3" dir tmp
+  dir="$(dirname "$dest")"
+  [[ -d "$dir" ]] || install -d -m 0755 "$dir"
+  tmp="$(mktemp "${dir}/.ocserv-deploy.XXXXXX")"
+  install -m "$mode" "$src" "$tmp"
+  mv -f -- "$tmp" "$dest"
+}
+
+# Promotes the staged files to their live locations with fixed modes. Only
+# invoked after the staged password database has been populated.
+install_staged_files() {
+  _atomic_install_file 0600 "$STAGED_OCSERV_CONF" "$OCSERV_CONF"
+  _atomic_install_file 0600 "$STAGED_OCSERV_PASSWD" "$OCSERV_PASSWD"
+  _atomic_install_file 0755 "$STAGED_NETWORK_HELPER" "$NETWORK_HELPER"
+  _atomic_install_file 0644 "$STAGED_SYSTEMD_DROPIN" "$SYSTEMD_DROPIN"
+  if [[ "$OCSERV_CERT_MODE" == "letsencrypt" ]]; then
+    _atomic_install_file 0755 "$STAGED_CERT_HOOK" "$CERT_HOOK"
+  else
+    install -d -m 0700 "$(dirname "$SELF_SIGNED_KEY")"
+    _atomic_install_file 0600 "$STAGED_SELF_SIGNED_KEY" "$SELF_SIGNED_KEY"
+    _atomic_install_file 0644 "$STAGED_SELF_SIGNED_CERT" "$SELF_SIGNED_CERT"
+    if [[ -n "$CERT_HOOK_DELETE" ]]; then
+      rm -f -- "$CERT_HOOK"
+    fi
+  fi
+}
+
+# ==================== Service activation and verification ====================
+
+activate_service() {
+  systemctl daemon-reload
+  systemctl enable ocserv.service
+  systemctl restart ocserv.service
+}
+
+verify_service() {
+  systemctl is-active --quiet ocserv.service ||
+    die "ocserv.service is not active after restart"
+  [[ -n "$(ss -H -ltn "sport = :${OCSERV_PORT}")" ]] ||
+    die "no TCP listener on port ${OCSERV_PORT}"
+  [[ -n "$(ss -H -lun "sport = :${OCSERV_PORT}")" ]] ||
+    die "no UDP listener on port ${OCSERV_PORT}"
+}
+
+print_install_summary() {
+  printf 'OpenConnect endpoint: %s:%s\n' "$OCSERV_ENDPOINT" "$OCSERV_PORT"
+  printf 'Azure NSG required: allow TCP %s and UDP %s\n' "$OCSERV_PORT" "$OCSERV_PORT"
+  printf 'Certificate mode: %s\n' "$OCSERV_CERT_MODE"
+  if [[ "$OCSERV_CERT_MODE" == "selfsigned" ]]; then
+    local fingerprint pin
+    fingerprint="$(
+      openssl x509 -in "$SELF_SIGNED_CERT" -noout -fingerprint -sha256 |
+        sed 's/^.*=//'
+    )"
+    pin="$(
+      openssl x509 -in "$SELF_SIGNED_CERT" -pubkey -noout |
+        openssl pkey -pubin -outform DER |
+        openssl dgst -sha256 -binary |
+        openssl enc -base64
+    )"
+    printf 'Certificate SHA-256 fingerprint: %s\n' "$fingerprint"
+    printf 'pin-sha256: %s\n' "$pin"
+  fi
+}
+
+# Orchestrates the transactional install: snapshot, stage, validate,
+# populate the password DB, atomically install, activate, and verify.
+install_server() {
+  begin_transaction
+  snapshot_target "$OCSERV_CONF"
+  snapshot_target "$OCSERV_PASSWD"
+  snapshot_target "$SELF_SIGNED_CERT"
+  snapshot_target "$SELF_SIGNED_KEY"
+  snapshot_target "$NETWORK_HELPER"
+  snapshot_target "$SYSTEMD_DROPIN"
+  snapshot_target "$CERT_HOOK"
+  prepare_certificate
+  stage_managed_files
+  validate_staged_files
+  ensure_initial_user "$STAGED_OCSERV_PASSWD"
+  install_staged_files
+  activate_service
+  verify_service
+  commit_transaction
+  print_install_summary
+}
+
 usage() {
   printf '%s\n' \
     "Usage: ocserv-deploy.sh install" \
@@ -632,9 +927,17 @@ main() {
       ;;
     install)
       require_root
+      install -d -m 0755 "$(dirname "$INSTALL_LOCK")"
+      exec 9>"$INSTALL_LOCK"
+      flock -n 9 || die "another installation is running"
       load_config
       validate_common_config
-      die "unsupported command in configuration-only build: $1"
+      check_existing_config
+      check_managed_targets
+      check_route_overlap
+      check_port_available
+      install_dependencies
+      install_server
       ;;
     add-user)
       require_root
