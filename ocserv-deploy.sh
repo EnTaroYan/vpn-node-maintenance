@@ -231,6 +231,171 @@ HOOK_EOF
   chmod +x "$output"
 }
 
+# ==================== Network helper and systemd lifecycle ====================
+
+# Renders a standalone, self-contained Bash helper implementing the
+# nftables lifecycle contract (check/up/down). Only the validated
+# OCSERV_IPV4_NETWORK subnet is substituted at render time; the egress
+# interface is detected at the helper's own runtime, every invocation, so
+# it always reflects the current default route.
+render_network_helper() {
+  local output="$1"
+  [[ "$OCSERV_IPV4_NETWORK" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] ||
+    die "invalid OCSERV_IPV4_NETWORK for network helper rendering"
+  install -d -m 0755 "$(dirname "$output")"
+  cat >"$output" <<'HELPER_EOF'
+#!/usr/bin/env bash
+# Managed by vpn-node-maintenance: ocserv-deploy.sh
+
+set -Eeuo pipefail
+readonly TABLE_FAMILY="ip"
+readonly TABLE_NAME="vpn_node_ocserv"
+readonly SENTINEL="_managed_by_vpn_node_maintenance"
+readonly VPN_SUBNET="@@VPN_SUBNET@@"
+readonly LOCK_FILE="/run/lock/ocserv-network.lock"
+
+log() {
+  printf '%s [ocserv-network] %s\n' "$(date --iso-8601=seconds)" "$*"
+}
+
+die() {
+  log "ERROR: $*" >&2
+  exit 1
+}
+
+get_egress_interface() {
+  local interface
+  interface="$(
+    ip -4 route get 1.1.1.1 |
+      awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}'
+  )"
+  [[ "$interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] ||
+    die "cannot determine a safe IPv4 egress interface"
+  printf '%s\n' "$interface"
+}
+
+table_exists() {
+  nft list table "$TABLE_FAMILY" "$1" >/dev/null 2>&1
+}
+
+chain_exists() {
+  nft list chain "$TABLE_FAMILY" "$1" "$2" >/dev/null 2>&1
+}
+
+# Verifies that the given table is either absent or owned by us (contains
+# the sentinel chain). Never deletes anything; callers that need to delete
+# must call this first and only proceed to delete after it succeeds.
+ensure_table_ownership() {
+  local table_name="$1"
+  if table_exists "$table_name"; then
+    chain_exists "$table_name" "$SENTINEL" ||
+      die "table $table_name exists but is not managed by vpn-node-maintenance; refusing to modify"
+  fi
+}
+
+delete_owned_table() {
+  local table_name="$1"
+  ensure_table_ownership "$table_name"
+  if table_exists "$table_name"; then
+    nft delete table "$TABLE_FAMILY" "$table_name"
+  fi
+}
+
+render_ruleset() {
+  local table_name="$1" interface="$2"
+  cat <<RULESET_EOF
+table $TABLE_FAMILY $table_name {
+  chain $SENTINEL {
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    ip saddr $VPN_SUBNET oifname "$interface" accept
+    ip daddr $VPN_SUBNET iifname "$interface" ct state established,related accept
+  }
+
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr $VPN_SUBNET oifname "$interface" masquerade
+  }
+}
+RULESET_EOF
+}
+
+# Holds the current temporary rule file path so the EXIT trap can clean it
+# up. Declared at script scope (not "local") because it must still be
+# bound under "set -u" when the trap fires at process exit, well after the
+# function that created it has returned.
+RULE_FILE=""
+
+cmd_check() {
+  # Validate ownership of the real table first so check enforces the same
+  # safety contract as up/down, even though it never applies anything.
+  ensure_table_ownership "$TABLE_NAME"
+  local interface check_table
+  interface="$(get_egress_interface)"
+  check_table="${TABLE_NAME}_check_${BASHPID}"
+  RULE_FILE="$(mktemp)"
+  trap 'rm -f -- "$RULE_FILE"' EXIT
+  render_ruleset "$check_table" "$interface" >"$RULE_FILE"
+  nft --check -f "$RULE_FILE"
+}
+
+cmd_up() {
+  ensure_table_ownership "$TABLE_NAME"
+  local interface
+  interface="$(get_egress_interface)"
+  if table_exists "$TABLE_NAME"; then
+    nft delete table "$TABLE_FAMILY" "$TABLE_NAME"
+  fi
+  RULE_FILE="$(mktemp)"
+  trap 'rm -f -- "$RULE_FILE"' EXIT
+  render_ruleset "$TABLE_NAME" "$interface" >"$RULE_FILE"
+  sysctl -w net.ipv4.ip_forward=1
+  nft -f "$RULE_FILE"
+}
+
+cmd_down() {
+  delete_owned_table "$TABLE_NAME"
+}
+
+main() {
+  case "${1:-}" in
+    check) cmd_check ;;
+    up) cmd_up ;;
+    down) cmd_down ;;
+    *) die "usage: $(basename "$0") {check|up|down}" ;;
+  esac
+}
+
+exec 9>"$LOCK_FILE"
+flock 9
+main "$@"
+HELPER_EOF
+  sed -i "s|@@VPN_SUBNET@@|${OCSERV_IPV4_NETWORK}|" "$output"
+  chmod 0755 "$output"
+}
+
+# Renders the systemd drop-in that ties the nftables helper into the
+# ocserv.service lifecycle. Uses the true absolute installed path for the
+# helper regardless of any ROOT_PREFIX used for test isolation, since this
+# content is only ever meaningful on the real running system.
+render_systemd_dropin() {
+  local output="$1"
+  install -d -m 0755 "$(dirname "$output")"
+  cat >"$output" <<EOF
+$MANAGED_MARKER
+[Unit]
+Wants=network-online.target
+After=network-online.target nftables.service
+PartOf=nftables.service
+
+[Service]
+ExecStartPre=/usr/local/libexec/vpn-node/ocserv-network up
+ExecStopPost=/usr/local/libexec/vpn-node/ocserv-network down
+EOF
+}
+
 # ==================== Managed configuration ====================
 
 is_managed_file() {

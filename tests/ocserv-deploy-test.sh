@@ -1114,4 +1114,453 @@ run_test "route overlap conflict fails" test_check_route_overlap_conflict_fails
 run_test "route overlap unrelated route passes" test_check_route_overlap_unrelated_passes
 run_test "test_ocserv_config invokes ocserv --test-config" test_test_ocserv_config_invokes_test_config
 
+# ==================== Task 5: nftables Helper and systemd Lifecycle ====================
+
+_write_mock_ip_route_get() {
+  local interface="$1"
+  cat >"$TEST_ROOT/bin/ip" <<MOCK_EOF
+#!/usr/bin/env bash
+printf '1.1.1.1 via 172.16.0.1 dev ${interface} src 172.16.0.4 uid 0\n'
+printf '    cache\n'
+MOCK_EOF
+  chmod +x "$TEST_ROOT/bin/ip"
+}
+
+_write_mock_sysctl() {
+  cat >"$TEST_ROOT/bin/sysctl" <<'MOCK_EOF'
+#!/usr/bin/env bash
+printf 'ARGS: %s\n' "$*" >> "${TEST_ROOT}/sysctl-args.log"
+exit 0
+MOCK_EOF
+  chmod +x "$TEST_ROOT/bin/sysctl"
+}
+
+# Fake nft that tracks table/chain existence as marker files under
+# $TEST_ROOT/nft-state/<table>/chain_<name>, logs every invocation (with
+# start/end timestamps for lock-serialization checks), and records the last
+# rule file it was given so tests can inspect rendered rule content.
+_write_mock_nft() {
+  cat >"$TEST_ROOT/bin/nft" <<'MOCK_EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+STATE_DIR="${TEST_ROOT}/nft-state"
+LOG="${TEST_ROOT}/nft-args.log"
+TIMELINE_LOG="${TEST_ROOT}/nft-timeline.log"
+mkdir -p "$STATE_DIR"
+start_ts="$(date +%s%N)"
+finish() {
+  local end_ts
+  end_ts="$(date +%s%N)"
+  printf '%s %s\n' "$start_ts" "$end_ts" >> "$TIMELINE_LOG"
+}
+trap finish EXIT
+printf 'ARGS: %s\n' "$*" >> "$LOG"
+sleep 0.2
+
+case "$1" in
+  list)
+    case "$2" in
+      table)
+        [[ -d "${STATE_DIR}/$4" ]] || exit 1
+        exit 0
+        ;;
+      chain)
+        [[ -f "${STATE_DIR}/$4/chain_$5" ]] || exit 1
+        exit 0
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  --check)
+    [[ "$2" == "-f" ]] || exit 1
+    file="$3"
+    cp -- "$file" "${TEST_ROOT}/last-ruleset.nft"
+    [[ -s "$file" ]] || exit 1
+    exit 0
+    ;;
+  -f)
+    file="$2"
+    cp -- "$file" "${TEST_ROOT}/last-ruleset.nft"
+    [[ -s "$file" ]] || exit 1
+    name="$(awk '$1=="table"{print $3; exit}' "$file")"
+    mkdir -p "${STATE_DIR}/${name}"
+    while IFS= read -r chain_name; do
+      : >"${STATE_DIR}/${name}/chain_${chain_name}"
+    done < <(awk '$1=="chain"{print $2}' "$file")
+    exit 0
+    ;;
+  delete)
+    [[ "$2" == "table" ]] || exit 1
+    name="$4"
+    rm -rf -- "${STATE_DIR:?}/${name}"
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+MOCK_EOF
+  chmod +x "$TEST_ROOT/bin/nft"
+}
+
+_seed_owned_table() {
+  mkdir -p "$TEST_ROOT/nft-state/vpn_node_ocserv"
+  : >"$TEST_ROOT/nft-state/vpn_node_ocserv/chain__managed_by_vpn_node_maintenance"
+}
+
+_seed_unowned_table() {
+  mkdir -p "$TEST_ROOT/nft-state/vpn_node_ocserv"
+  : >"$TEST_ROOT/nft-state/vpn_node_ocserv/chain_input"
+}
+
+_network_helper_fixture() {
+  local subnet="${1:-10.66.0.0/24}"
+  write_config "
+OCSERV_ENDPOINT=\"vpn.example.com\"
+OCSERV_PORT=\"8443\"
+OCSERV_IPV4_NETWORK=\"${subnet}\"
+OCSERV_DNS=(\"8.8.4.4\")
+OCSERV_CERT_MODE=\"selfsigned\"
+"
+  source_deployer
+  load_config
+  validate_common_config
+  _write_mock_ip_route_get "eth0"
+  _write_mock_sysctl
+  _write_mock_nft
+}
+
+_render_helper() {
+  local helper="$TEST_ROOT/network-helper"
+  render_network_helper "$helper"
+  printf '%s' "$helper"
+}
+
+test_render_network_helper_output_is_executable() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  local helper; helper="$(_render_helper)"
+  [[ -x "$helper" ]] || fail "rendered network helper must be executable"
+}
+
+test_render_network_helper_check_absent_table_succeeds() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" check
+}
+
+test_render_network_helper_check_invokes_check_only_no_apply() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" check
+  local ok=0
+  grep -qE '^ARGS: --check -f' "$TEST_ROOT/nft-args.log" ||
+    { fail "check must invoke nft --check -f"; ok=1; }
+  if grep -qE '^ARGS: -f ' "$TEST_ROOT/nft-args.log"; then
+    fail "check must not apply a table via nft -f"
+    ok=1
+  fi
+  if [[ -n "$(find "$TEST_ROOT/nft-state" -mindepth 1 2>/dev/null)" ]]; then
+    fail "check must not leave any applied nftables state behind"
+    ok=1
+  fi
+  return "$ok"
+}
+
+test_render_network_helper_check_does_not_touch_ip_forward() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" check
+  [[ ! -s "$TEST_ROOT/sysctl-args.log" ]] ||
+    fail "check must not modify net.ipv4.ip_forward"
+}
+
+test_render_network_helper_up_absent_table_succeeds() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" up
+}
+
+test_render_network_helper_up_sets_ip_forward() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" up
+  grep -qF 'ARGS: -w net.ipv4.ip_forward=1' "$TEST_ROOT/sysctl-args.log" ||
+    fail "up must invoke sysctl -w net.ipv4.ip_forward=1"
+}
+
+test_render_network_helper_up_rules_contain_expected_elements_only() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" up
+  local out="$TEST_ROOT/last-ruleset.nft" ok=0
+  grep -Fq '10.66.0.0/24' "$out" || { fail "ruleset must reference the configured subnet"; ok=1; }
+  grep -Fq 'oifname "eth0"' "$out" || { fail "ruleset must reference the detected egress interface"; ok=1; }
+  grep -Fq 'masquerade' "$out" || { fail "ruleset must contain a masquerade rule"; ok=1; }
+  grep -Fq 'ct state established,related accept' "$out" ||
+    { fail "ruleset must return established/related traffic"; ok=1; }
+  return "$ok"
+}
+
+test_render_network_helper_forward_chain_policy_accept() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" up
+  grep -Fq 'type filter hook forward priority filter; policy accept;' "$TEST_ROOT/last-ruleset.nft" ||
+    fail "forward base chain must use policy accept"
+}
+
+test_render_network_helper_no_input_chain_or_drop_policy() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" up
+  local out="$TEST_ROOT/last-ruleset.nft" ok=0
+  if grep -qi 'hook input' "$out"; then
+    fail "ruleset must not define an INPUT chain"
+    ok=1
+  fi
+  if grep -qi 'policy drop' "$out"; then
+    fail "ruleset must not use a DROP policy"
+    ok=1
+  fi
+  return "$ok"
+}
+
+test_render_network_helper_table_contains_sentinel_chain() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" up
+  grep -Fq 'chain _managed_by_vpn_node_maintenance {' "$TEST_ROOT/last-ruleset.nft" ||
+    fail "table must contain the sentinel chain"
+}
+
+test_render_network_helper_uses_configured_subnet_not_hardcoded() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture "10.77.0.0/24"
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" up
+  local out="$TEST_ROOT/last-ruleset.nft" ok=0
+  grep -Fq '10.77.0.0/24' "$out" ||
+    { fail "ruleset must use the configured subnet"; ok=1; }
+  if grep -Fq '10.66.0.0/24' "$out"; then
+    fail "ruleset must not contain an unrelated hardcoded subnet"
+    ok=1
+  fi
+  return "$ok"
+}
+
+test_render_network_helper_up_replaces_owned_table() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  _seed_owned_table
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" up
+  local ok=0
+  grep -qF 'ARGS: delete table ip vpn_node_ocserv' "$TEST_ROOT/nft-args.log" ||
+    { fail "up must delete the previously owned table before re-applying"; ok=1; }
+  [[ -f "$TEST_ROOT/nft-state/vpn_node_ocserv/chain__managed_by_vpn_node_maintenance" ]] ||
+    { fail "re-applied table must contain the sentinel chain"; ok=1; }
+  [[ -f "$TEST_ROOT/nft-state/vpn_node_ocserv/chain_forward" ]] ||
+    { fail "re-applied table must contain the forward chain"; ok=1; }
+  return "$ok"
+}
+
+test_render_network_helper_down_absent_table_succeeds() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" down
+  if grep -qF 'ARGS: delete' "$TEST_ROOT/nft-args.log" 2>/dev/null; then
+    fail "down must not attempt to delete a table that does not exist"
+  fi
+}
+
+test_render_network_helper_down_deletes_owned_table() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  _seed_owned_table
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" down
+  [[ ! -d "$TEST_ROOT/nft-state/vpn_node_ocserv" ]] ||
+    fail "down must delete the owned table"
+}
+
+test_render_network_helper_down_never_resets_ip_forward() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  _seed_owned_table
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" down
+  [[ ! -s "$TEST_ROOT/sysctl-args.log" ]] ||
+    fail "down must never modify net.ipv4.ip_forward"
+}
+
+test_render_network_helper_check_unowned_table_fails_without_deletion() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  _seed_unowned_table
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_failure "$helper" check
+  local ok=0
+  [[ -d "$TEST_ROOT/nft-state/vpn_node_ocserv" ]] ||
+    { fail "unowned table must not be deleted by check"; ok=1; }
+  if grep -qE '^ARGS: (delete|--check|-f )' "$TEST_ROOT/nft-args.log" 2>/dev/null; then
+    fail "check must abort before deleting or applying anything when table is unowned"
+    ok=1
+  fi
+  return "$ok"
+}
+
+test_render_network_helper_up_unowned_table_fails_without_deletion() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  _seed_unowned_table
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_failure "$helper" up
+  local ok=0
+  [[ -d "$TEST_ROOT/nft-state/vpn_node_ocserv" ]] ||
+    { fail "unowned table must not be deleted by up"; ok=1; }
+  [[ -f "$TEST_ROOT/nft-state/vpn_node_ocserv/chain_input" ]] ||
+    { fail "unowned table contents must be left untouched by up"; ok=1; }
+  [[ ! -s "$TEST_ROOT/sysctl-args.log" ]] ||
+    { fail "up must not touch ip_forward when ownership check fails"; ok=1; }
+  return "$ok"
+}
+
+test_render_network_helper_down_unowned_table_fails_without_deletion() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  _seed_unowned_table
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_failure "$helper" down
+  [[ -d "$TEST_ROOT/nft-state/vpn_node_ocserv" ]] ||
+    fail "unowned table must not be deleted by down"
+}
+
+test_render_network_helper_ownership_verified_before_deletion() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  _seed_owned_table
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" down
+  local ok=0
+  local chain_check_line delete_line
+  chain_check_line="$(grep -nF 'ARGS: list chain ip vpn_node_ocserv _managed_by_vpn_node_maintenance' \
+    "$TEST_ROOT/nft-args.log" | head -1 | cut -d: -f1)"
+  delete_line="$(grep -nF 'ARGS: delete table ip vpn_node_ocserv' \
+    "$TEST_ROOT/nft-args.log" | head -1 | cut -d: -f1)"
+  if [[ -z "$chain_check_line" || -z "$delete_line" ]]; then
+    fail "expected both a sentinel-chain check and a delete invocation"
+    ok=1
+  elif ((chain_check_line >= delete_line)); then
+    fail "sentinel-chain ownership must be verified before the table is deleted"
+    ok=1
+  fi
+  return "$ok"
+}
+
+test_render_network_helper_lock_serializes_concurrent_checks() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" "$helper" check &
+  local pid1=$!
+  PATH="$TEST_ROOT/bin:$PATH" "$helper" check &
+  local pid2=$!
+  wait "$pid1"
+  wait "$pid2"
+  local ok=0
+  if [[ ! -f "$TEST_ROOT/nft-timeline.log" ]]; then
+    fail "expected nft-timeline.log to be created by the mocked nft invocations"
+    return 1
+  fi
+  local line_count
+  line_count="$(wc -l < "$TEST_ROOT/nft-timeline.log")"
+  if ((line_count < 4)); then
+    fail "expected at least 4 nft invocations across two concurrent check runs (got $line_count)"
+    ok=1
+  fi
+  local prev_end=0 start end
+  while read -r start end; do
+    if ((start < prev_end)); then
+      fail "nft invocations from concurrent helper runs overlapped; the lock did not serialize them"
+      ok=1
+    fi
+    prev_end="$end"
+  done < <(sort -n -k1,1 "$TEST_ROOT/nft-timeline.log")
+  return "$ok"
+}
+
+# ---------- render_systemd_dropin ----------
+
+test_render_systemd_dropin_contents() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  source_deployer
+  local out="$TEST_ROOT/10-network.conf"
+  render_systemd_dropin "$out"
+  local ok=0
+  grep -Fqx "$MANAGED_MARKER" "$out" || { fail "drop-in must start with the managed marker"; ok=1; }
+  grep -Fqx 'Wants=network-online.target' "$out" || { fail "missing Wants=network-online.target"; ok=1; }
+  grep -Fqx 'After=network-online.target nftables.service' "$out" ||
+    { fail "missing After=network-online.target nftables.service"; ok=1; }
+  grep -Fqx 'PartOf=nftables.service' "$out" || { fail "missing PartOf=nftables.service"; ok=1; }
+  grep -Fqx 'ExecStartPre=/usr/local/libexec/vpn-node/ocserv-network up' "$out" ||
+    { fail "missing ExecStartPre for ocserv-network up"; ok=1; }
+  grep -Fqx 'ExecStopPost=/usr/local/libexec/vpn-node/ocserv-network down' "$out" ||
+    { fail "missing ExecStopPost for ocserv-network down"; ok=1; }
+  return "$ok"
+}
+
+run_test "network helper output is executable" test_render_network_helper_output_is_executable
+run_test "check succeeds when table is absent" test_render_network_helper_check_absent_table_succeeds
+run_test "check invokes nft --check without applying" test_render_network_helper_check_invokes_check_only_no_apply
+run_test "check does not touch ip_forward" test_render_network_helper_check_does_not_touch_ip_forward
+run_test "up succeeds when table is absent" test_render_network_helper_up_absent_table_succeeds
+run_test "up sets net.ipv4.ip_forward=1" test_render_network_helper_up_sets_ip_forward
+run_test "up rules contain only expected elements" test_render_network_helper_up_rules_contain_expected_elements_only
+run_test "forward chain uses policy accept" test_render_network_helper_forward_chain_policy_accept
+run_test "no INPUT chain or DROP policy" test_render_network_helper_no_input_chain_or_drop_policy
+run_test "table contains sentinel chain" test_render_network_helper_table_contains_sentinel_chain
+run_test "uses configured subnet, not hardcoded" test_render_network_helper_uses_configured_subnet_not_hardcoded
+run_test "up replaces an owned table" test_render_network_helper_up_replaces_owned_table
+run_test "down succeeds when table is absent" test_render_network_helper_down_absent_table_succeeds
+run_test "down deletes an owned table" test_render_network_helper_down_deletes_owned_table
+run_test "down never resets ip_forward" test_render_network_helper_down_never_resets_ip_forward
+run_test "check on unowned table fails without deletion" test_render_network_helper_check_unowned_table_fails_without_deletion
+run_test "up on unowned table fails without deletion" test_render_network_helper_up_unowned_table_fails_without_deletion
+run_test "down on unowned table fails without deletion" test_render_network_helper_down_unowned_table_fails_without_deletion
+run_test "ownership verified before deletion" test_render_network_helper_ownership_verified_before_deletion
+run_test "lock serializes concurrent check invocations" test_render_network_helper_lock_serializes_concurrent_checks
+run_test "systemd drop-in contents" test_render_systemd_dropin_contents
+
 finish_tests
