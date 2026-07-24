@@ -1004,6 +1004,23 @@ test_check_port_available_managed_rerun_port_change_conflict_fails() {
   assert_failure check_port_available
 }
 
+test_check_port_available_managed_rerun_same_port_non_ocserv_owner_fails() {
+  new_fixture
+  listener_pid=""
+  trap 'kill "$listener_pid" 2>/dev/null; remove_fixture' EXIT
+  source_deployer
+  local port
+  port="$(_free_tcp_port)"
+  OCSERV_PORT="$port"
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf '%s\ntcp-port = %s\nudp-port = %s\n' "$MANAGED_MARKER" "$port" "$port" >"$OCSERV_CONF"
+  # Listener is plain python3 (not ocserv) on the same configured port.
+  # The ownership check must reject it even on a managed rerun.
+  listener_pid="$(_start_test_listener "$(command -v python3)" "$OCSERV_PORT")"
+  sleep 0.5
+  assert_failure check_port_available
+}
+
 # ---------- check_route_overlap ----------
 
 _write_mock_ip() {
@@ -1092,6 +1109,7 @@ run_test "free port passes" test_check_port_available_free_port_passes
 run_test "port owned by other process fails" test_check_port_available_other_process_fails
 run_test "managed rerun allows ocserv listener on same port" test_check_port_available_managed_rerun_allows_ocserv
 run_test "managed rerun port change conflict fails" test_check_port_available_managed_rerun_port_change_conflict_fails
+run_test "managed rerun same port non-ocserv owner fails" test_check_port_available_managed_rerun_same_port_non_ocserv_owner_fails
 run_test "route overlap conflict fails" test_check_route_overlap_conflict_fails
 run_test "route overlap unrelated route passes" test_check_route_overlap_unrelated_passes
 run_test "test_ocserv_config invokes ocserv --test-config" test_test_ocserv_config_invokes_test_config
