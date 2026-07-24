@@ -15,3 +15,6 @@ cloudflare-acme.ini
 *~
 *.swp
 .DS_Store
+
+# Local Git worktrees
+.worktrees/
