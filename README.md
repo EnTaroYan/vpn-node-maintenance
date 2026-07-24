@@ -4,8 +4,8 @@
 
 - `vpn.example.com:443`：预留给 SoftEther。
 - `vpn.example.com:8443`：预留给 ocserv（OpenConnect/AnyConnect）。
-- Cloudflare DDNS：公网 IPv4 变化后自动更新同一域名的 A 记录。
-- Let's Encrypt：通过 Cloudflare DNS-01 签发和自动续签证书，不占用 80 或 443。
+- Cloudflare DDNS：公网 IPv4 变化后自动更新同一 Zone 下的多个 A 记录。
+- Let's Encrypt：通过 Cloudflare DNS-01 签发和自动续签根域名及通配符证书，不占用 80 或 443。
 
 当前项目只包含 DDNS 和证书生命周期管理。ocserv 与 SoftEther 的安装脚本将在后续加入。
 
@@ -14,12 +14,12 @@
 ```text
 vpn-ddns.timer
   -> vpn-maintenance.sh ddns
-  -> 更新 Cloudflare DNS-only A 记录
+  -> 更新多个 Cloudflare DNS-only A 记录
 
 certbot.timer
   -> certbot renew
   -> DNS-01 验证成功
-  -> 更新 /etc/letsencrypt/live/vpn.example.com/
+  -> 更新 /etc/letsencrypt/live/example.com/
   -> 执行 deploy hooks
   -> 通知 ocserv 和 SoftEther 加载新证书
 ```
@@ -56,8 +56,8 @@ sudo apt install -y curl jq certbot python3-certbot-dns-cloudflare
 
 建议创建两个独立 API Token，并都只授权目标 Zone：
 
-1. DDNS Token：供脚本查询和更新 `vpn.example.com` 的 A 记录。
-2. ACME Token：供 Certbot 创建和删除 `_acme-challenge.vpn.example.com` TXT 记录。
+1. DDNS Token：供脚本查询和更新配置的多个 A 记录。
+2. ACME Token：供 Certbot 创建和删除 `_acme-challenge.example.com` TXT 记录。
 
 不要使用 Global API Key，也不要把 Token 写入 Git 仓库。
 
@@ -83,10 +83,29 @@ sudoedit /etc/vpn-maintenance.env
 ```ini
 CF_DDNS_API_TOKEN="DDNS_API_TOKEN"
 CF_ZONE_ID="CLOUDFLARE_ZONE_ID"
-CF_RECORD_NAME="vpn.example.com"
-CERT_NAME="vpn.example.com"
+CF_RECORD_NAMES=(
+  "vpn.example.com"
+  "node.example.com"
+)
+CERT_NAME="example.com"
+CERT_DOMAINS=(
+  "example.com"
+  "*.example.com"
+)
 LE_EMAIL="admin@example.com"
 ```
+
+`CF_RECORD_NAMES` 是 Bash 数组，其中所有记录必须属于 `CF_ZONE_ID` 指定的同一个 Cloudflare Zone。脚本获取一次公网 IPv4，然后依次创建或更新每个 DNS-only A 记录。旧配置 `CF_RECORD_NAME="vpn.example.com"` 仍然兼容。
+
+`CERT_NAME` 是 Certbot lineage 名称，决定证书目录；`CERT_DOMAINS` 是证书实际包含的 SAN：
+
+- `example.com` 覆盖根域名本身。
+- `*.example.com` 覆盖 `vpn.example.com`、`node.example.com` 等一级子域名。
+- `*.example.com` **不覆盖** `a.b.example.com`，也不自动覆盖 `example.com`，因此示例中同时列出两项。
+
+普通的 `example.com` 证书不能给 `vpn.example.com` 使用；必须显式申请 `*.example.com` 通配符 SAN，或逐个列出三级域名。
+
+通配符必须写在引号中，避免 Shell 将 `*` 展开成本地文件名。
 
 脚本要求 `/etc/vpn-maintenance.env`：
 
@@ -125,8 +144,8 @@ sudo /usr/local/sbin/vpn-maintenance.sh issue-cert
 证书将位于：
 
 ```text
-/etc/letsencrypt/live/vpn.example.com/fullchain.pem
-/etc/letsencrypt/live/vpn.example.com/privkey.pem
+/etc/letsencrypt/live/example.com/fullchain.pem
+/etc/letsencrypt/live/example.com/privkey.pem
 ```
 
 ### 5. 启用定时任务
@@ -147,9 +166,11 @@ sudo vpn-maintenance.sh issue-cert
 sudo vpn-maintenance.sh renew-cert
 ```
 
-- `ddns`：获取当前公网 IPv4，必要时创建或更新 Cloudflare A 记录。
-- `issue-cert`：首次通过 Cloudflare DNS-01 签发证书。已有同名 Certbot lineage 时不会重复签发。
+- `ddns`：获取一次当前公网 IPv4，必要时创建或更新配置的全部 Cloudflare A 记录。
+- `issue-cert`：通过 Cloudflare DNS-01 签发证书；已有同名且域名集合较小的 lineage 时扩展证书 SAN。
 - `renew-cert`：手动要求 Certbot检查指定证书是否需要续签。
+
+Certbot 会把成功签发时的 SAN 集合写入 renewal 配置，之后的自动续签会沿用该集合。修改 `CERT_DOMAINS` 后，需要再次手动运行 `issue-cert` 才会扩展现有证书。
 
 ## Certbot hook
 
@@ -171,8 +192,8 @@ Certbot 支持三类 hook：
 ocserv 配置直接引用 Certbot 文件：
 
 ```ini
-server-cert = /etc/letsencrypt/live/vpn.example.com/fullchain.pem
-server-key = /etc/letsencrypt/live/vpn.example.com/privkey.pem
+server-cert = /etc/letsencrypt/live/example.com/fullchain.pem
+server-key = /etc/letsencrypt/live/example.com/privkey.pem
 ```
 
 创建 `/etc/letsencrypt/renewal-hooks/deploy/20-ocserv`：
@@ -181,7 +202,7 @@ server-key = /etc/letsencrypt/live/vpn.example.com/privkey.pem
 #!/bin/sh
 
 [ "$RENEWED_LINEAGE" = \
-  "/etc/letsencrypt/live/vpn.example.com" ] || exit 0
+  "/etc/letsencrypt/live/example.com" ] || exit 0
 
 if systemctl is-active --quiet ocserv.service; then
   systemctl kill --kill-who=main --signal=HUP ocserv.service

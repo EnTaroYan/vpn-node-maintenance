@@ -7,6 +7,9 @@ readonly CONFIG_FILE="${VPN_MAINTENANCE_CONFIG:-/etc/vpn-maintenance.env}"
 readonly LOCK_DIR="${VPN_MAINTENANCE_LOCK_DIR:-/run/lock}"
 readonly CF_API_BASE="https://api.cloudflare.com/client/v4"
 
+declare -a DDNS_RECORD_NAMES=()
+declare -a REQUESTED_CERT_DOMAINS=()
+
 log() {
   printf '%s [vpn-maintenance] %s\n' "$(date --iso-8601=seconds)" "$*"
 }
@@ -21,8 +24,8 @@ usage() {
 Usage: vpn-maintenance.sh COMMAND
 
 Commands:
-  ddns         Update the Cloudflare DNS-only A record when the public IP changes
-  issue-cert   Obtain the initial Let's Encrypt certificate through Cloudflare DNS-01
+  ddns         Update Cloudflare DNS-only A records when the public IP changes
+  issue-cert   Obtain or expand a Let's Encrypt certificate through Cloudflare DNS-01
   renew-cert   Ask Certbot to renew the configured certificate when it is due
 EOF
 }
@@ -85,6 +88,33 @@ valid_ipv4() {
   done
 }
 
+valid_hostname() {
+  local hostname="${1%.}"
+  local label
+  local -a labels
+
+  [[ -n "$hostname" && ${#hostname} -le 253 && "$hostname" == *.* ]] ||
+    return 1
+  [[ "$hostname" != *..* ]] || return 1
+
+  IFS='.' read -r -a labels <<<"$hostname"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] ||
+      return 1
+  done
+}
+
+valid_certificate_domain() {
+  local domain="$1"
+
+  if [[ "$domain" == "*."* ]]; then
+    valid_hostname "${domain#*.}"
+  else
+    valid_hostname "$domain"
+  fi
+}
+
 get_public_ipv4() {
   local response
   local ip
@@ -137,22 +167,45 @@ assert_cloudflare_success() {
 }
 
 validate_ddns_config() {
+  local record_name
+  local index
+  local -A seen=()
+
   require_var CF_DDNS_API_TOKEN
   require_var CF_ZONE_ID
-  require_var CF_RECORD_NAME
 
   [[ "$CF_ZONE_ID" =~ ^[0-9a-fA-F]{32}$ ]] ||
     die "CF_ZONE_ID must be a 32-character hexadecimal zone ID"
-  [[ "$CF_RECORD_NAME" =~ ^[A-Za-z0-9.-]+$ ]] ||
-    die "CF_RECORD_NAME contains invalid characters"
+
+  if declare -p CF_RECORD_NAMES >/dev/null 2>&1; then
+    DDNS_RECORD_NAMES=("${CF_RECORD_NAMES[@]}")
+  elif [[ -n "${CF_RECORD_NAME:-}" ]]; then
+    DDNS_RECORD_NAMES=("$CF_RECORD_NAME")
+  fi
+
+  ((${#DDNS_RECORD_NAMES[@]} > 0)) ||
+    die "set CF_RECORD_NAMES or the legacy CF_RECORD_NAME"
+
+  for index in "${!DDNS_RECORD_NAMES[@]}"; do
+    record_name="${DDNS_RECORD_NAMES[$index],,}"
+    record_name="${record_name%.}"
+    valid_hostname "$record_name" ||
+      die "invalid DNS record name: ${DDNS_RECORD_NAMES[$index]}"
+    [[ -z "${seen[$record_name]+x}" ]] ||
+      die "duplicate DNS record name: $record_name"
+    seen["$record_name"]=1
+    DDNS_RECORD_NAMES[$index]="$record_name"
+  done
+
   [[ "$CF_TTL" =~ ^[0-9]+$ ]] || die "CF_TTL must be numeric"
   if ((CF_TTL != 1 && (CF_TTL < 60 || CF_TTL > 86400))); then
     die "CF_TTL must be 1 (automatic) or between 60 and 86400"
   fi
 }
 
-update_ddns() {
-  local public_ip
+sync_ddns_record() {
+  local record_name="$1"
+  local public_ip="$2"
   local query_response
   local record_count
   local record_id
@@ -162,16 +215,9 @@ update_ddns() {
   local payload
   local update_response
 
-  require_command curl
-  require_command jq
-  require_command flock
-  validate_ddns_config
-  acquire_lock ddns
-
-  public_ip="$(get_public_ipv4)"
   query_response="$(
     cloudflare_request GET \
-      "/zones/${CF_ZONE_ID}/dns_records?type=A&name=${CF_RECORD_NAME}"
+      "/zones/${CF_ZONE_ID}/dns_records?type=A&name=${record_name}"
   )"
   assert_cloudflare_success "$query_response"
 
@@ -180,7 +226,7 @@ update_ddns() {
     0)
       payload="$(
         jq -cn \
-          --arg name "$CF_RECORD_NAME" \
+          --arg name "$record_name" \
           --arg content "$public_ip" \
           --argjson ttl "$CF_TTL" \
           '{type:"A", name:$name, content:$content, ttl:$ttl, proxied:false}'
@@ -189,7 +235,7 @@ update_ddns() {
         cloudflare_request POST "/zones/${CF_ZONE_ID}/dns_records" "$payload"
       )"
       assert_cloudflare_success "$update_response"
-      log "created DNS-only A record ${CF_RECORD_NAME} -> ${public_ip}"
+      log "created DNS-only A record ${record_name} -> ${public_ip}"
       ;;
     1)
       record_id="$(jq -r '.result[0].id' <<<"$query_response")"
@@ -200,7 +246,7 @@ update_ddns() {
       if [[ "$current_ip" == "$public_ip" &&
             "$current_proxied" == "false" &&
             "$current_ttl" == "$CF_TTL" ]]; then
-        log "DNS record is current: ${CF_RECORD_NAME} -> ${public_ip}"
+        log "DNS record is current: ${record_name} -> ${public_ip}"
         return
       fi
 
@@ -215,21 +261,61 @@ update_ddns() {
           "/zones/${CF_ZONE_ID}/dns_records/${record_id}" "$payload"
       )"
       assert_cloudflare_success "$update_response"
-      log "updated DNS-only A record ${CF_RECORD_NAME}: ${current_ip} -> ${public_ip}"
+      log "updated DNS-only A record ${record_name}: ${current_ip} -> ${public_ip}"
       ;;
     *)
-      die "multiple A records found for ${CF_RECORD_NAME}; refusing to choose one"
+      die "multiple A records found for ${record_name}; refusing to choose one"
       ;;
   esac
 }
 
+update_ddns() {
+  local public_ip
+  local record_name
+
+  require_command curl
+  require_command jq
+  require_command flock
+  validate_ddns_config
+  acquire_lock ddns
+
+  public_ip="$(get_public_ipv4)"
+  for record_name in "${DDNS_RECORD_NAMES[@]}"; do
+    sync_ddns_record "$record_name" "$public_ip"
+  done
+}
+
 validate_certificate_config() {
+  local domain
+  local index
+  local -A seen=()
+
   require_var CERT_NAME
   require_var LE_EMAIL
   require_var CF_DNS_CREDENTIALS_FILE
 
-  [[ "$CERT_NAME" =~ ^[A-Za-z0-9.-]+$ ]] ||
-    die "CERT_NAME contains invalid characters"
+  valid_hostname "$CERT_NAME" || die "CERT_NAME must be a valid DNS name"
+
+  if declare -p CERT_DOMAINS >/dev/null 2>&1; then
+    REQUESTED_CERT_DOMAINS=("${CERT_DOMAINS[@]}")
+  else
+    REQUESTED_CERT_DOMAINS=("$CERT_NAME")
+  fi
+
+  ((${#REQUESTED_CERT_DOMAINS[@]} > 0)) ||
+    die "CERT_DOMAINS must contain at least one DNS name"
+
+  for index in "${!REQUESTED_CERT_DOMAINS[@]}"; do
+    domain="${REQUESTED_CERT_DOMAINS[$index],,}"
+    domain="${domain%.}"
+    valid_certificate_domain "$domain" ||
+      die "invalid certificate domain: ${REQUESTED_CERT_DOMAINS[$index]}"
+    [[ -z "${seen[$domain]+x}" ]] ||
+      die "duplicate certificate domain: $domain"
+    seen["$domain"]=1
+    REQUESTED_CERT_DOMAINS[$index]="$domain"
+  done
+
   [[ -f "$CF_DNS_CREDENTIALS_FILE" ]] ||
     die "Cloudflare ACME credentials file not found: $CF_DNS_CREDENTIALS_FILE"
   [[ "$(stat -c '%u' "$CF_DNS_CREDENTIALS_FILE")" -eq 0 ]] ||
@@ -242,13 +328,20 @@ validate_certificate_config() {
 }
 
 issue_certificate() {
+  local domain
+  local -a domain_args=()
+  local -a lineage_args=()
+
   require_command "$CERTBOT_BIN"
   validate_certificate_config
   acquire_lock certificate
 
+  for domain in "${REQUESTED_CERT_DOMAINS[@]}"; do
+    domain_args+=(-d "$domain")
+  done
+
   if [[ -f "${LE_CONFIG_DIR}/renewal/${CERT_NAME}.conf" ]]; then
-    log "certificate lineage already exists: ${CERT_NAME}"
-    return
+    lineage_args+=(--expand)
   fi
 
   "$CERTBOT_BIN" certonly \
@@ -258,12 +351,13 @@ issue_certificate() {
     --dns-cloudflare \
     --dns-cloudflare-credentials "$CF_DNS_CREDENTIALS_FILE" \
     --cert-name "$CERT_NAME" \
-    -d "$CERT_NAME" \
+    "${domain_args[@]}" \
+    "${lineage_args[@]}" \
     --key-type rsa \
     --rsa-key-size 2048 \
     --reuse-key
 
-  log "issued certificate: ${CERT_NAME}"
+  log "issued or updated certificate: ${CERT_NAME} (${REQUESTED_CERT_DOMAINS[*]})"
 }
 
 renew_certificate() {
