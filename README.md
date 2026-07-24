@@ -7,7 +7,7 @@
 - Cloudflare DDNS：公网 IPv4 变化后自动更新同一 Zone 下的多个 A 记录。
 - Let's Encrypt：通过 Cloudflare DNS-01 签发和自动续签根域名及通配符证书，不占用 80 或 443。
 
-当前项目只包含 DDNS 和证书生命周期管理。ocserv 与 SoftEther 的安装脚本将在后续加入。
+项目包含 DDNS、证书生命周期管理，以及 `ocserv-deploy.sh`（OpenConnect/AnyConnect 服务端一键部署）。SoftEther 的安装脚本将在后续加入。
 
 ## 工作方式
 
@@ -38,6 +38,8 @@ certbot.timer
 | `vpn-maintenance.env.example` | 非敏感配置模板 |
 | `vpn-ddns.service` | systemd DDNS oneshot service |
 | `vpn-ddns.timer` | systemd DDNS 定时器 |
+| `ocserv-deploy.sh` | ocserv（OpenConnect/AnyConnect）一键安装、用户管理 |
+| `tests/ocserv-deploy-test.sh` | `ocserv-deploy.sh` 的 Bash 测试套件 |
 
 ## 前置条件
 
@@ -245,6 +247,130 @@ SoftEther 不会持续读取 Certbot 文件，需要在另一个 deploy hook 中
 
 该 hook 同样读取 `/etc/vpn-maintenance.env` 并派生 `CERT_FULLCHAIN_FILE` 和 `CERT_PRIVATE_KEY_FILE`，再传给 `vpncmd`。SoftEther 安装脚本应先导入一次当前证书，再创建 hook。管理员凭据不得写入 env 或仓库，应放在独立的 root-only 凭据文件中。
 
+## ocserv 部署（OpenConnect / AnyConnect）
+
+`ocserv-deploy.sh` 是幂等、事务化的一键安装脚本：安装步骤失败时自动回滚到安装前的文件和服务状态，成功后原子替换所有受管文件。
+
+### 支持的系统
+
+- 操作系统：Ubuntu 22.04 或 24.04（通过 `/etc/os-release` 的 `ID`/`VERSION_ID` 检测，其他发行版或版本直接拒绝）。
+- 架构：`amd64` 或 `arm64`（通过 `dpkg --print-architecture` 检测）。
+- 依赖包由脚本在 `install` 时自动安装：`ocserv`、`nftables`、`openssl`、`iproute2`、`util-linux`。
+
+### 新增的 5 个配置项
+
+在 `/etc/vpn-maintenance.env` 中追加（默认值见 `vpn-maintenance.env.example`）：
+
+| 变量 | 默认示例 | 说明 |
+|---|---|---|
+| `OCSERV_ENDPOINT` | `"vpn.example.com"` | 客户端连接的域名或裸 IPv4 地址，同时用于证书 SAN 匹配。 |
+| `OCSERV_PORT` | `"8443"` | TCP 与 UDP 共用同一个端口号（`tcp-port`/`udp-port`）。 |
+| `OCSERV_IPV4_NETWORK` | `"10.66.0.0/24"` | 分配给 VPN 客户端的 IPv4 网段，必须是 `/24` 网络地址，且不得与现有路由重叠。 |
+| `OCSERV_DNS` | `OCSERV_DNS=("8.8.4.4")` | 下发给客户端的 DNS 服务器，Bash 索引数组，可写多个，不能为空。 |
+| `OCSERV_CERT_MODE` | `"letsencrypt"` | 证书模式，只能是 `letsencrypt` 或 `selfsigned`。 |
+
+`OCSERV_PORT` 必须在 1-65535 之间；`OCSERV_IPV4_NETWORK` 只接受 `/24`；`OCSERV_DNS` 必须声明为索引数组（`OCSERV_DNS="8.8.4.4"` 这种标量写法会被拒绝）。
+
+### 证书模式
+
+#### `letsencrypt` 模式
+
+- 前置条件：已通过本项目的 `vpn-maintenance.sh issue-cert` 成功签发证书，且 `CERT_DOMAINS`／`CERT_NAME` 覆盖 `OCSERV_ENDPOINT`（域名场景通常需要 `*.example.com` 通配符 SAN）。
+- 证书路径由 `LE_CONFIG_DIR`（默认 `/etc/letsencrypt`）和 `CERT_NAME` 派生：`live/${CERT_NAME}/fullchain.pem` 与 `.../privkey.pem`。
+- **`install` 不会代为签发证书**：证书或私钥文件缺失、证书与私钥不匹配、证书已过期、或证书 SAN 与 `OCSERV_ENDPOINT` 不匹配，都会导致安装立即失败退出（`die`），不会创建或修改任何受管文件。
+- 安装成功后会创建 Certbot deploy hook `/etc/letsencrypt/renewal-hooks/deploy/20-ocserv`，证书续签后自动 `systemctl reload ocserv.service`。
+
+#### `selfsigned` 模式
+
+- 完全独立于 DDNS、Cloudflare 和 Certbot：不需要 `CF_*`、`CERT_NAME`、`CERT_DOMAINS`、`LE_EMAIL` 等任何一项配置。
+- 首次安装会生成一张 10 年有效期的自签名证书（`/etc/ocserv/ssl/selfsigned-{cert,key}.pem`），CN/SAN 绑定到 `OCSERV_ENDPOINT`；再次安装会复用已存在且匹配的证书/私钥对。
+- **不会创建任何 Certbot hook**。如果之前是 `letsencrypt` 模式且已经创建了受管 hook，切换到 `selfsigned` 时该 hook 会被自动删除；如果 hook 路径上存在非本工具管理的文件，则原样保留、不做任何改动。
+
+### 域名 vs 裸 IP 端点的证书行为
+
+`OCSERV_ENDPOINT` 是否为合法 IPv4 字面量决定证书校验方式：
+
+- 裸 IP（如 `104.46.217.92`）：自签名证书使用 `IP` 类型的 SAN 生成，校验时用 `openssl x509 -checkip`。
+- 域名（如 `vpn.example.com`）：自签名证书使用 `DNS` 类型的 SAN，校验时用 `openssl x509 -checkhost`。
+
+两种校验在 `letsencrypt` 模式下同样适用于已有证书。公共 CA 通常不为 IPv4 地址签发证书，因此裸 IP 端点应使用 `selfsigned` 模式；只有域名端点才适合 `letsencrypt` 模式。
+
+### 命令
+
+```bash
+sudo ./ocserv-deploy.sh install
+sudo ./ocserv-deploy.sh add-user [USERNAME]
+sudo ./ocserv-deploy.sh del-user [USERNAME]
+sudo ./ocserv-deploy.sh help
+```
+
+- `install`：校验配置、安装依赖包、生成/复用证书、渲染并原子替换所有受管文件、启用并重启 `ocserv.service`、验证 TCP/UDP 监听。首次安装且密码库为空时会交互式提示创建一个初始 VPN 用户。任一步骤失败都会完整回滚（恢复文件、systemd 启用/激活状态）。同一时刻只允许一个 `install` 实例运行（`/run/lock/ocserv-deploy.lock`）。
+- `add-user [USERNAME]`：省略用户名时交互式提示；交互式输入两次密码并确认一致后写入 `ocpasswd`；用户名已存在会失败。
+- `del-user [USERNAME]`：省略用户名时交互式提示；删除不存在的用户名会失败。
+
+### 生成的文件与管理标记
+
+| 路径 | 内容 |
+|---|---|
+| `/etc/ocserv/ocserv.conf` | ocserv 主配置 |
+| `/etc/ocserv/ocpasswd` | `ocpasswd` 格式的用户密码库，跨多次 `install` 保留 |
+| `/etc/ocserv/ssl/selfsigned-cert.pem`、`selfsigned-key.pem` | 仅 `selfsigned` 模式生成 |
+| `/usr/local/libexec/vpn-node/ocserv-network` | nftables 生命周期辅助脚本（`check`/`up`/`down`） |
+| `/etc/systemd/system/ocserv.service.d/10-network.conf` | systemd 服务 drop-in，绑定 nftables 生命周期 |
+| `/etc/letsencrypt/renewal-hooks/deploy/20-ocserv` | 仅 `letsencrypt` 模式生成的 Certbot deploy hook |
+
+除 `ocpasswd`（用户密码库需要跨版本保留）外，以上每个受管文件的第一行都写入固定标记：
+
+```text
+# Managed by vpn-node-maintenance: ocserv-deploy.sh
+```
+
+`install` 在覆盖任何目标前都会检查：路径不存在则可以创建；路径存在但不含该标记，则视为"非本工具管理"，直接拒绝安装并原样保留该文件（`ocserv.conf` 额外备份一份到 `.pre-vpn-node-<UTC时间戳>.bak` 后再报错退出）。这保证了 `ocserv-deploy.sh` 永远不会静默覆盖手工维护或第三方工具生成的配置。
+
+### 全隧道、NAT 与防火墙
+
+- 客户端配置固定 `route = default`，即全隧道（所有客户端流量经由 VPN 出口）。
+- 脚本渲染并应用专用 nftables 表 `vpn_node_ocserv`（`ip` 协议族），包含：
+  - `_managed_by_vpn_node_maintenance`：空的哨兵链，仅用于标识该表由本工具管理。
+  - `forward` 链（`hook forward`，`policy accept`）：仅放行 VPN 网段与检测到的出口网卡之间的双向流量。
+  - `postrouting` 链（`hook postrouting`，`policy accept`）：对经出口网卡离开的 VPN 网段流量做 `masquerade`。
+- 出口网卡通过 `ip -4 route get 1.1.1.1` 在每次 `ocserv-network up`/`down`/`check` 时动态探测，始终跟随当前默认路由。
+- **脚本不安装任何 `INPUT` 链或过滤策略**——不会新增、也不会收紧本机现有的入站防火墙规则；对 `OCSERV_PORT` 的入站放行完全依赖操作系统/云平台已有的防火墙或安全组配置。
+- `ocserv-network` 只会创建、替换或删除携带哨兵链的 `vpn_node_ocserv` 表；若发现同名但不含哨兵链的表，直接拒绝操作，不做任何修改或删除。
+
+### Azure NSG 要求
+
+`OCSERV_ENDPOINT`/`OCSERV_PORT` 对应的 TCP **和** UDP 必须同时在 Azure 网络安全组（NSG）中放行入站（AnyConnect 协议同时使用两者，UDP 用于 DTLS 数据通道）。仅放行 TCP 会导致连接建立但数据通道回退或体验下降。安装脚本结束时会打印 `Azure NSG required: allow TCP <port> and UDP <port>` 作为提示。
+
+### 开机行为
+
+- 安装成功后执行 `systemctl daemon-reload && systemctl enable ocserv.service && systemctl restart ocserv.service`，因此重启后 `ocserv.service` 会随系统自启动。
+- `10-network.conf` drop-in 通过 `ExecStartPre=.../ocserv-network up` 和 `ExecStopPost=.../ocserv-network down` 把 nftables 表的生命周期绑定到 `ocserv.service` 的启动/停止，保证每次开机、重启或手动 `systemctl restart ocserv` 时专用 nftables 表都会重新建立。
+
+### 故障排查
+
+```bash
+systemctl status ocserv.service
+journalctl -u ocserv.service -e
+sudo ss -lntup | grep "$OCSERV_PORT"
+sudo nft list table ip vpn_node_ocserv
+sudo occtl show status
+sudo occtl show users
+```
+
+- `systemctl status` / `journalctl`：查看服务是否激活、启动失败原因。
+- `ss -lntup`：确认 TCP 和 UDP 均在 `OCSERV_PORT` 上监听。
+- `nft list table ip vpn_node_ocserv`：确认哨兵链、`forward`、`postrouting`（含 `masquerade`）规则均存在。
+- `occtl`：查看当前连接的用户、流量与会话状态（需要 `use-occtl = true`，脚本已默认开启）。
+
+### 与 SoftEther 共存
+
+在同一台主机上部署 ocserv 与 SoftEther 时，必须为两者预留不同的：
+
+- **端口**：本项目约定 SoftEther 使用 `443`，ocserv 使用 `OCSERV_PORT`（默认 `8443`）；两者不能共用同一 TCP/UDP 端口。
+- **地址池**：`OCSERV_IPV4_NETWORK`（默认 `10.66.0.0/24`）必须与 SoftEther 的虚拟 DHCP/地址池网段不重叠，否则 `check_route_overlap` 会在 `install` 时直接拒绝。
+- **nftables 表**：ocserv 使用专属表名 `vpn_node_ocserv`，不会触碰其他表；SoftEther 若也使用 nftables/iptables 管理转发规则，应使用不同的表名，避免互相覆盖。
+
 ## 状态与日志
 
 ```bash
@@ -264,3 +390,5 @@ DDNS 日志会显示记录未变化、创建或更新结果，但不会输出 AP
 - 不要提交 API Token、私钥、证书或 SoftEther 管理密码。
 - 如果服务器位于 NAT 后面，需要固定内网地址并转发 `443/TCP`、`8443/TCP` 和 `8443/UDP`。
 - 如果公网地址属于 CGNAT，DDNS 无法使服务器接受公网入站连接。
+- `/etc/ocserv/ocpasswd`、自签名私钥 `/etc/ocserv/ssl/selfsigned-key.pem` 均以 `0600` 安装，不得提交到仓库。
+- `selfsigned` 模式下客户端必须使用安装完成时打印的 `pin-sha256` 公钥指纹（`--servercert pin-sha256:...`）连接，不要绕过证书校验。

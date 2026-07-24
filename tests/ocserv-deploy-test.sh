@@ -9,6 +9,15 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$REPO_ROOT/tests/testlib.sh"
 
+# --real-tools: validate staged rendering against the actual system
+# ocserv/nft/ip binaries instead of the PATH-shadowed test doubles used by
+# every other test in this file. Every artifact still lives under a
+# per-run OCSERV_DEPLOY_ROOT prefix; see test_real_tools_staged_validation.
+REAL_TOOLS_MODE=0
+if [[ "${1:-}" == "--real-tools" ]]; then
+  REAL_TOOLS_MODE=1
+fi
+
 new_fixture() {
   TEST_ROOT="$(mktemp -d)"
   export TEST_ROOT
@@ -33,6 +42,62 @@ write_config() {
 source_deployer() {
   OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/ocserv-deploy.sh"
 }
+
+# ---------- --real-tools: real ocserv/nft/ip staged validation ----------
+#
+# Renders a self-signed certificate, ocserv.conf, and the ocserv-network
+# helper exactly as install_server would stage them, then validates them
+# with the real "ocserv --test-config", real "nft --check", and real
+# "ip route get" (all installed on the target in Task 7 Step 3) instead of
+# the $TEST_ROOT/bin test doubles every other test in this file relies on.
+# All rendered paths still live under this run's OCSERV_DEPLOY_ROOT/TEST_ROOT
+# prefix. Deliberately bypasses install_server/begin_transaction/rollback
+# entirely (no systemctl, no "ocserv-network up", no install_staged_files)
+# so a validation failure here can never start ocserv.service, enable it,
+# or apply the vpn_node_ocserv nftables table on the real host.
+test_real_tools_staged_validation() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT/stage"; remove_fixture' EXIT
+  write_config '
+OCSERV_ENDPOINT="104.46.217.92"
+OCSERV_PORT="18443"
+OCSERV_IPV4_NETWORK="10.66.77.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  source_deployer
+  load_config
+  validate_common_config
+
+  install -d -m 0700 "$TEST_ROOT/stage"
+  STAGED_OCSERV_CONF="$TEST_ROOT/stage/ocserv.conf"
+  STAGED_NETWORK_HELPER="$TEST_ROOT/stage/ocserv-network"
+
+  # OCSERV_PASSWD (referenced by the "auth" line) is the real, prefixed
+  # live path; ocserv --test-config only parses syntax, it never needs to
+  # start listening, so no live install/activation ever occurs here.
+  install -d -m 0700 "$(dirname "$OCSERV_PASSWD")"
+  install -m 0600 /dev/null "$OCSERV_PASSWD"
+
+  prepare_certificate
+  render_ocserv_config "$STAGED_OCSERV_CONF"
+  chmod 0600 "$STAGED_OCSERV_CONF"
+  render_network_helper "$STAGED_NETWORK_HELPER"
+
+  local ok=0
+  assert_success test_ocserv_config "$STAGED_OCSERV_CONF" || ok=1
+  assert_success "$STAGED_NETWORK_HELPER" check || ok=1
+  assert_failure systemctl is-active --quiet ocserv.service || ok=1
+  assert_failure nft list table ip vpn_node_ocserv || ok=1
+  return "$ok"
+}
+
+if ((REAL_TOOLS_MODE)); then
+  run_test "real-tools staged validation (real ocserv/nft/ip, no start/apply)" \
+    test_real_tools_staged_validation
+  finish_tests
+  exit $?
+fi
 
 test_valid_common_config() {
   new_fixture
