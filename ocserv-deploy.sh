@@ -97,8 +97,11 @@ validate_common_config() {
     *) die "OCSERV_CERT_MODE must be letsencrypt or selfsigned" ;;
   esac
   parse_ipv4_24 "$OCSERV_IPV4_NETWORK"
-  declare -p OCSERV_DNS >/dev/null 2>&1 ||
-    die "OCSERV_DNS must be a Bash array"
+  local _dns_decl
+  _dns_decl="$(declare -p OCSERV_DNS 2>/dev/null)" ||
+    die "OCSERV_DNS must be an indexed Bash array"
+  [[ "$_dns_decl" =~ ^'declare -'[a-z]*'a'[a-z]*' ' ]] ||
+    die "OCSERV_DNS must be an indexed Bash array (not scalar or associative)"
   NORMALIZED_DNS=("${OCSERV_DNS[@]}")
   ((${#NORMALIZED_DNS[@]} > 0)) || die "OCSERV_DNS cannot be empty"
   local dns

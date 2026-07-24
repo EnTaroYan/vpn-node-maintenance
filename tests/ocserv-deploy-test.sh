@@ -81,7 +81,24 @@ OCSERV_CERT_MODE="selfsigned"
   assert_success validate_common_config
 }
 
+# Regression test: scalar OCSERV_DNS must be rejected; only indexed Bash arrays are valid.
+test_rejects_scalar_dns() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS="8.8.4.4"
+OCSERV_CERT_MODE="selfsigned"
+'
+  source_deployer
+  load_config
+  assert_failure validate_common_config
+}
+
 run_test "valid common config" test_valid_common_config
 run_test "invalid port" test_rejects_invalid_port
 run_test "self-signed without DDNS" test_selfsigned_does_not_require_ddns_or_certbot_fields
+run_test "rejects scalar DNS" test_rejects_scalar_dns
 finish_tests
