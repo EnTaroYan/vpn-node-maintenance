@@ -1520,6 +1520,60 @@ test_render_network_helper_lock_serializes_concurrent_checks() {
   return "$ok"
 }
 
+# Regression test: earlier drafts hardcoded LOCK_FILE="/run/lock/ocserv-network.lock"
+# in the generated helper even when rendering under OCSERV_DEPLOY_ROOT, so
+# running the helper under a test root still created/opened the *real* host
+# lock file. This asserts both that the lock is rendered under the test
+# root and that the real host lock file is never created or touched.
+test_render_network_helper_lock_confined_to_root_prefix() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  local helper; helper="$(_render_helper)"
+  local ok=0
+  grep -qFx "readonly LOCK_FILE=\"${OCSERV_DEPLOY_ROOT}/run/lock/ocserv-network.lock\"" "$helper" ||
+    { fail "rendered LOCK_FILE must be confined under OCSERV_DEPLOY_ROOT in a test root"; ok=1; }
+  local real_lock="/run/lock/ocserv-network.lock"
+  local before="absent"
+  [[ -e "$real_lock" ]] && before="$(stat -c '%Y:%i' "$real_lock")"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" check || ok=1
+  local expected_lock="${OCSERV_DEPLOY_ROOT}/run/lock/ocserv-network.lock"
+  [[ -e "$expected_lock" ]] ||
+    { fail "expected the lock file to be created under OCSERV_DEPLOY_ROOT: $expected_lock"; ok=1; }
+  local after="absent"
+  [[ -e "$real_lock" ]] && after="$(stat -c '%Y:%i' "$real_lock")"
+  [[ "$before" == "$after" ]] ||
+    { fail "helper must never create or touch the real host lock file $real_lock (before=$before after=$after)"; ok=1; }
+  return "$ok"
+}
+
+# Regression test: when ROOT_PREFIX is empty (no OCSERV_DEPLOY_ROOT, i.e. a
+# real production install), the rendered LOCK_FILE must remain byte-for-byte
+# identical to the historical hardcoded production path. Sourced in a
+# separate bash process (via env -u) so the readonly ROOT_PREFIX/etc.
+# constants are computed fresh without OCSERV_DEPLOY_ROOT in the environment.
+test_render_network_helper_lock_file_matches_production_path_when_root_prefix_empty() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  local helper="$TEST_ROOT/network-helper-prod"
+  env -u OCSERV_DEPLOY_ROOT bash -c '
+    set -Eeuo pipefail
+    OCSERV_DEPLOY_SOURCE_ONLY=1 source "$0"
+    load_config
+    validate_common_config
+    render_network_helper "$1"
+  ' "$REPO_ROOT/ocserv-deploy.sh" "$helper"
+  grep -qFx 'readonly LOCK_FILE="/run/lock/ocserv-network.lock"' "$helper" ||
+    fail "production rendering (empty ROOT_PREFIX) must preserve the exact real lock path"
+}
+
 # ---------- render_systemd_dropin ----------
 
 test_render_systemd_dropin_contents() {
@@ -1561,6 +1615,8 @@ run_test "up on unowned table fails without deletion" test_render_network_helper
 run_test "down on unowned table fails without deletion" test_render_network_helper_down_unowned_table_fails_without_deletion
 run_test "ownership verified before deletion" test_render_network_helper_ownership_verified_before_deletion
 run_test "lock serializes concurrent check invocations" test_render_network_helper_lock_serializes_concurrent_checks
+run_test "lock file confined to OCSERV_DEPLOY_ROOT, real host lock untouched" test_render_network_helper_lock_confined_to_root_prefix
+run_test "lock file matches production path when ROOT_PREFIX is empty" test_render_network_helper_lock_file_matches_production_path_when_root_prefix_empty
 run_test "systemd drop-in contents" test_render_systemd_dropin_contents
 
 finish_tests

@@ -235,9 +235,14 @@ HOOK_EOF
 
 # Renders a standalone, self-contained Bash helper implementing the
 # nftables lifecycle contract (check/up/down). Only the validated
-# OCSERV_IPV4_NETWORK subnet is substituted at render time; the egress
-# interface is detected at the helper's own runtime, every invocation, so
-# it always reflects the current default route.
+# OCSERV_IPV4_NETWORK subnet and the lock file path are substituted at
+# render time; the egress interface is detected at the helper's own
+# runtime, every invocation, so it always reflects the current default
+# route. The lock path is rendered as "${ROOT_PREFIX}/run/lock/..."; when
+# ROOT_PREFIX is empty (real production installs) this is byte-for-byte
+# identical to the historical hardcoded "/run/lock/ocserv-network.lock",
+# and under a test root (OCSERV_DEPLOY_ROOT set) it is confined under that
+# root so tests never create or contend on the real host lock file.
 render_network_helper() {
   local output="$1"
   [[ "$OCSERV_IPV4_NETWORK" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] ||
@@ -252,7 +257,7 @@ readonly TABLE_FAMILY="ip"
 readonly TABLE_NAME="vpn_node_ocserv"
 readonly SENTINEL="_managed_by_vpn_node_maintenance"
 readonly VPN_SUBNET="@@VPN_SUBNET@@"
-readonly LOCK_FILE="/run/lock/ocserv-network.lock"
+readonly LOCK_FILE="@@LOCK_FILE@@"
 
 log() {
   printf '%s [ocserv-network] %s\n' "$(date --iso-8601=seconds)" "$*"
@@ -368,11 +373,17 @@ main() {
   esac
 }
 
+# Plain "mkdir -p" (no -m) so an already-existing directory is left
+# untouched (mode/ownership unchanged): on real hosts /run/lock is a
+# pre-existing tmpfs directory and this is a no-op; under a test root the
+# parent may not exist yet and must be created.
+mkdir -p -- "$(dirname "$LOCK_FILE")"
 exec 9>"$LOCK_FILE"
 flock 9
 main "$@"
 HELPER_EOF
   sed -i "s|@@VPN_SUBNET@@|${OCSERV_IPV4_NETWORK}|" "$output"
+  sed -i "s|@@LOCK_FILE@@|${ROOT_PREFIX}/run/lock/ocserv-network.lock|" "$output"
   chmod 0755 "$output"
 }
 
