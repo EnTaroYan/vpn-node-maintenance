@@ -752,4 +752,348 @@ run_test "delete existing user" test_delete_user_existing
 run_test "delete missing user rejected" test_delete_user_missing_rejected
 run_test "ensure initial user on empty file" test_ensure_initial_user_empty_prompts
 run_test "ensure initial user skips non-empty" test_ensure_initial_user_nonempty_skips
+
+# ==================== Task 4: Managed ocserv Configuration and Host Conflict Checks ====================
+
+_prepare_rendered_fixture() {
+  # Sets up a fully validated common config plus a self-signed certificate
+  # so render_ocserv_config has every input it needs (OCSERV_PASSWD,
+  # SERVER_CERT_FILE, SERVER_KEY_FILE, OCSERV_NETWORK_ADDRESS, ...).
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4" "1.1.1.1")
+OCSERV_CERT_MODE="selfsigned"
+'
+  source_deployer
+  load_config
+  validate_common_config
+  prepare_certificate
+}
+
+# ---------- render_ocserv_config ----------
+
+test_render_ocserv_config_marker_first_line() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _prepare_rendered_fixture
+  local out="$TEST_ROOT/rendered.conf"
+  render_ocserv_config "$out"
+  local first_line
+  first_line="$(head -n1 "$out")"
+  assert_eq "$MANAGED_MARKER" "$first_line" "rendered config first line"
+}
+
+test_render_ocserv_config_ports() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _prepare_rendered_fixture
+  local out="$TEST_ROOT/rendered.conf"
+  render_ocserv_config "$out"
+  local ok=0
+  grep -Fqx "tcp-port = ${OCSERV_PORT}" "$out" ||
+    { fail "tcp-port directive missing or wrong"; ok=1; }
+  grep -Fqx "udp-port = ${OCSERV_PORT}" "$out" ||
+    { fail "udp-port directive missing or wrong"; ok=1; }
+  return "$ok"
+}
+
+test_render_ocserv_config_auth() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _prepare_rendered_fixture
+  local out="$TEST_ROOT/rendered.conf"
+  render_ocserv_config "$out"
+  grep -Fqx "auth = \"plain[${OCSERV_PASSWD}]\"" "$out" ||
+    fail "auth directive must reference the effective OCSERV_PASSWD"
+}
+
+test_render_ocserv_config_certs() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _prepare_rendered_fixture
+  local out="$TEST_ROOT/rendered.conf"
+  render_ocserv_config "$out"
+  local ok=0
+  grep -Fqx "server-cert = ${SERVER_CERT_FILE}" "$out" ||
+    { fail "server-cert directive must match the selected certificate mode"; ok=1; }
+  grep -Fqx "server-key = ${SERVER_KEY_FILE}" "$out" ||
+    { fail "server-key directive must match the selected certificate mode"; ok=1; }
+  return "$ok"
+}
+
+test_render_ocserv_config_network() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _prepare_rendered_fixture
+  local out="$TEST_ROOT/rendered.conf"
+  render_ocserv_config "$out"
+  local ok=0
+  grep -Fqx "ipv4-network = ${OCSERV_NETWORK_ADDRESS}" "$out" ||
+    { fail "ipv4-network must derive from OCSERV_IPV4_NETWORK"; ok=1; }
+  grep -Fqx "ipv4-netmask = ${OCSERV_NETMASK}" "$out" ||
+    { fail "ipv4-netmask must derive from OCSERV_IPV4_NETWORK"; ok=1; }
+  return "$ok"
+}
+
+test_render_ocserv_config_dns_multiple() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _prepare_rendered_fixture
+  local out="$TEST_ROOT/rendered.conf"
+  render_ocserv_config "$out"
+  local ok=0
+  grep -Fqx "dns = 8.8.4.4" "$out" ||
+    { fail "expected dns = 8.8.4.4 directive"; ok=1; }
+  grep -Fqx "dns = 1.1.1.1" "$out" ||
+    { fail "expected dns = 1.1.1.1 directive"; ok=1; }
+  local dns_count
+  dns_count="$(grep -c '^dns = ' "$out")"
+  assert_eq "2" "$dns_count" "each OCSERV_DNS array item must render as its own directive" ||
+    ok=1
+  return "$ok"
+}
+
+test_render_ocserv_config_route_and_no_compression() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _prepare_rendered_fixture
+  local out="$TEST_ROOT/rendered.conf"
+  render_ocserv_config "$out"
+  local ok=0
+  grep -Fqx "route = default" "$out" ||
+    { fail "expected route = default directive"; ok=1; }
+  if grep -q '^compression' "$out"; then
+    fail "compression must not be enabled"
+    ok=1
+  fi
+  return "$ok"
+}
+
+# ---------- check_existing_config ----------
+
+test_check_existing_config_unknown_backed_up_and_fails() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf 'some unmanaged content\n' >"$OCSERV_CONF"
+  local ok=0
+  assert_failure check_existing_config || ok=1
+  local backups
+  backups=("${OCSERV_CONF}".pre-vpn-node-*.bak)
+  [[ -f "${backups[0]}" ]] ||
+    { fail "unmanaged config must be backed up before failing"; ok=1; }
+  grep -qF "some unmanaged content" "${backups[0]}" 2>/dev/null ||
+    { fail "backup must contain the original unmanaged content"; ok=1; }
+  return "$ok"
+}
+
+test_check_existing_config_managed_accepted() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf '%s\n' "$MANAGED_MARKER" >"$OCSERV_CONF"
+  local ok=0
+  assert_success check_existing_config || ok=1
+  assert_eq "1" "$CONF_EXISTED_BEFORE_INSTALL" \
+    "CONF_EXISTED_BEFORE_INSTALL must be captured for pre-existing managed config" || ok=1
+  return "$ok"
+}
+
+test_check_existing_config_absent_passes() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  local ok=0
+  assert_success check_existing_config || ok=1
+  assert_eq "0" "$CONF_EXISTED_BEFORE_INSTALL" \
+    "CONF_EXISTED_BEFORE_INSTALL must be 0 when no config existed before install" || ok=1
+  return "$ok"
+}
+
+# ---------- check_port_available ----------
+
+_free_tcp_port() {
+  python3 - <<'PYEOF'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PYEOF
+}
+
+_start_test_listener() {
+  # Starts a background TCP listener on the given port using the given
+  # executable (invoked by full path so its process name/comm matches the
+  # executable's own file name), and echoes its PID.
+  local exe="$1" port="$2"
+  "$exe" - "$port" >/dev/null 2>&1 <<'PYEOF' &
+import socket, sys, time
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", port))
+s.listen(1)
+time.sleep(10)
+PYEOF
+  echo $!
+}
+
+_write_mock_ocserv_listener_binary() {
+  # A real executable literally named "ocserv" so `ss -p` reports the
+  # owning process name as "ocserv" (comm derives from the exec'd path).
+  cp "$(command -v python3)" "$TEST_ROOT/bin/ocserv"
+  chmod +x "$TEST_ROOT/bin/ocserv"
+}
+
+test_check_port_available_free_port_passes() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  OCSERV_PORT="$(_free_tcp_port)"
+  assert_success check_port_available
+}
+
+test_check_port_available_other_process_fails() {
+  new_fixture
+  listener_pid=""
+  trap 'kill "$listener_pid" 2>/dev/null; remove_fixture' EXIT
+  source_deployer
+  OCSERV_PORT="$(_free_tcp_port)"
+  listener_pid="$(_start_test_listener "$(command -v python3)" "$OCSERV_PORT")"
+  sleep 0.5
+  assert_failure check_port_available
+}
+
+test_check_port_available_managed_rerun_allows_ocserv() {
+  new_fixture
+  listener_pid=""
+  trap 'kill "$listener_pid" 2>/dev/null; remove_fixture' EXIT
+  source_deployer
+  local port
+  port="$(_free_tcp_port)"
+  OCSERV_PORT="$port"
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf '%s\ntcp-port = %s\nudp-port = %s\n' "$MANAGED_MARKER" "$port" "$port" >"$OCSERV_CONF"
+  _write_mock_ocserv_listener_binary
+  listener_pid="$(_start_test_listener "$TEST_ROOT/bin/ocserv" "$port")"
+  sleep 0.5
+  assert_success check_port_available
+}
+
+test_check_port_available_managed_rerun_port_change_conflict_fails() {
+  new_fixture
+  listener_pid=""
+  trap 'kill "$listener_pid" 2>/dev/null; remove_fixture' EXIT
+  source_deployer
+  local old_port new_port
+  old_port="$(_free_tcp_port)"
+  new_port="$(_free_tcp_port)"
+  while [[ "$new_port" == "$old_port" ]]; do
+    new_port="$(_free_tcp_port)"
+  done
+  OCSERV_PORT="$new_port"
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf '%s\ntcp-port = %s\nudp-port = %s\n' "$MANAGED_MARKER" "$old_port" "$old_port" >"$OCSERV_CONF"
+  listener_pid="$(_start_test_listener "$(command -v python3)" "$new_port")"
+  sleep 0.5
+  assert_failure check_port_available
+}
+
+# ---------- check_route_overlap ----------
+
+_write_mock_ip() {
+  local routes_file="$TEST_ROOT/mock_routes.txt"
+  printf '%s\n' "$1" >"$routes_file"
+  cat >"$TEST_ROOT/bin/ip" <<MOCK_EOF
+#!/usr/bin/env bash
+cat "$routes_file"
+MOCK_EOF
+  chmod +x "$TEST_ROOT/bin/ip"
+}
+
+test_check_route_overlap_conflict_fails() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  source_deployer
+  load_config
+  validate_common_config
+  _write_mock_ip 'default via 172.16.0.1 dev eth0 proto dhcp src 172.16.0.4 metric 100
+10.66.0.128/26 dev eth0 proto kernel scope link src 10.66.0.129 metric 100'
+  PATH="$TEST_ROOT/bin:$PATH" assert_failure check_route_overlap
+}
+
+test_check_route_overlap_unrelated_passes() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  source_deployer
+  load_config
+  validate_common_config
+  _write_mock_ip 'default via 172.16.0.1 dev eth0 proto dhcp src 172.16.0.4 metric 100
+172.16.0.0/24 dev eth0 proto kernel scope link src 172.16.0.4 metric 100
+172.16.0.1 dev eth0 proto dhcp scope link src 172.16.0.4 metric 100'
+  PATH="$TEST_ROOT/bin:$PATH" assert_success check_route_overlap
+}
+
+# ---------- test_ocserv_config ----------
+
+_write_mock_ocserv_cli() {
+  cat >"$TEST_ROOT/bin/ocserv" <<'MOCK_EOF'
+#!/usr/bin/env bash
+printf 'ARGS: %s\n' "$*" >> "${TEST_ROOT}/ocserv-args.log"
+exit 0
+MOCK_EOF
+  chmod +x "$TEST_ROOT/bin/ocserv"
+}
+
+test_test_ocserv_config_invokes_test_config() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  source_deployer
+  _write_mock_ocserv_cli
+  local temp_conf="$TEST_ROOT/temp.conf"
+  : >"$temp_conf"
+  local ok=0
+  PATH="$TEST_ROOT/bin:$PATH" assert_success test_ocserv_config "$temp_conf" || ok=1
+  grep -qF "ARGS: -c ${temp_conf} --test-config" "$TEST_ROOT/ocserv-args.log" 2>/dev/null ||
+    { fail "test_ocserv_config must invoke: ocserv -c \$TEMP_CONF --test-config"; ok=1; }
+  return "$ok"
+}
+
+run_test "render config marker first line" test_render_ocserv_config_marker_first_line
+run_test "render config TCP/UDP ports" test_render_ocserv_config_ports
+run_test "render config auth" test_render_ocserv_config_auth
+run_test "render config certificate paths" test_render_ocserv_config_certs
+run_test "render config network/mask" test_render_ocserv_config_network
+run_test "render config multiple DNS directives" test_render_ocserv_config_dns_multiple
+run_test "render config route default, no compression" test_render_ocserv_config_route_and_no_compression
+run_test "unknown existing config backed up and fails" test_check_existing_config_unknown_backed_up_and_fails
+run_test "managed existing config accepted" test_check_existing_config_managed_accepted
+run_test "absent existing config passes" test_check_existing_config_absent_passes
+run_test "free port passes" test_check_port_available_free_port_passes
+run_test "port owned by other process fails" test_check_port_available_other_process_fails
+run_test "managed rerun allows ocserv listener on same port" test_check_port_available_managed_rerun_allows_ocserv
+run_test "managed rerun port change conflict fails" test_check_port_available_managed_rerun_port_change_conflict_fails
+run_test "route overlap conflict fails" test_check_route_overlap_conflict_fails
+run_test "route overlap unrelated route passes" test_check_route_overlap_unrelated_passes
+run_test "test_ocserv_config invokes ocserv --test-config" test_test_ocserv_config_invokes_test_config
+
 finish_tests

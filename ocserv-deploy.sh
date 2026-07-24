@@ -21,6 +21,7 @@ OCSERV_NETMASK=""
 SERVER_CERT_FILE=""
 SERVER_KEY_FILE=""
 CERT_HOOK_DELETE=""
+CONF_EXISTED_BEFORE_INSTALL=0
 
 log() {
   printf '%s [ocserv-deploy] %s\n' "$(date --iso-8601=seconds)" "$*"
@@ -228,6 +229,147 @@ readonly CERT_LIVE_DIR="${LE_CONFIG_DIR:-/etc/letsencrypt}/live/${CERT_NAME}"
 systemctl reload ocserv.service
 HOOK_EOF
   chmod +x "$output"
+}
+
+# ==================== Managed configuration ====================
+
+is_managed_file() {
+  local path="$1"
+  [[ -f "$path" ]] && grep -Fqx "$MANAGED_MARKER" "$path"
+}
+
+check_existing_config() {
+  if [[ -e "$OCSERV_CONF" ]]; then
+    CONF_EXISTED_BEFORE_INSTALL=1
+    if ! is_managed_file "$OCSERV_CONF"; then
+      local backup
+      backup="${OCSERV_CONF}.pre-vpn-node-$(date -u +%Y%m%dT%H%M%SZ).bak"
+      cp -a -- "$OCSERV_CONF" "$backup"
+      die "existing unmanaged ocserv config backed up to $backup; refusing to overwrite"
+    fi
+  else
+    CONF_EXISTED_BEFORE_INSTALL=0
+  fi
+}
+
+render_ocserv_config() {
+  local output="$1"
+  local dns dns_lines=""
+  for dns in "${NORMALIZED_DNS[@]}"; do
+    dns_lines+="dns = ${dns}"$'\n'
+  done
+  cat >"$output" <<EOF
+$MANAGED_MARKER
+auth = "plain[$OCSERV_PASSWD]"
+tcp-port = $OCSERV_PORT
+udp-port = $OCSERV_PORT
+run-as-user = nobody
+run-as-group = daemon
+socket-file = /run/ocserv.socket
+occtl-socket-file = /run/occtl.socket
+server-cert = $SERVER_CERT_FILE
+server-key = $SERVER_KEY_FILE
+isolate-workers = true
+max-clients = 128
+max-same-clients = 2
+keepalive = 32400
+dpd = 90
+mobile-dpd = 1800
+try-mtu-discovery = true
+auth-timeout = 240
+idle-timeout = 1200
+mobile-idle-timeout = 1800
+session-timeout = 0
+cookie-timeout = 300
+deny-roaming = false
+tls-priorities = "NORMAL:%SERVER_PRECEDENCE:%COMPAT:-VERS-SSL3.0:-VERS-TLS1.0:-VERS-TLS1.1"
+device = vpns
+predictable-ips = true
+ipv4-network = $OCSERV_NETWORK_ADDRESS
+ipv4-netmask = $OCSERV_NETMASK
+${dns_lines}route = default
+cisco-client-compat = true
+log-level = 1
+use-occtl = true
+EOF
+}
+
+ipv4_to_int() {
+  local ip="$1"
+  local a b c d
+  IFS='.' read -r a b c d <<<"$ip"
+  valid_ipv4 "$ip" || die "invalid IPv4 address in route: $ip"
+  printf '%u\n' "$((((10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d) & 0xFFFFFFFF))"
+}
+
+cidr_bounds() {
+  local cidr="$1" address prefix ip_value mask start end
+  if [[ "$cidr" == */* ]]; then
+    address="${cidr%/*}"
+    prefix="${cidr#*/}"
+  else
+    address="$cidr"
+    prefix=32
+  fi
+  [[ "$prefix" =~ ^[0-9]+$ ]] && ((prefix >= 0 && prefix <= 32)) ||
+    die "invalid route prefix: $cidr"
+  ip_value="$(ipv4_to_int "$address")"
+  if ((prefix == 0)); then
+    mask=0
+  else
+    mask=$(((0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF))
+  fi
+  start=$((ip_value & mask))
+  end=$((start | ((~mask) & 0xFFFFFFFF)))
+  printf '%u %u\n' "$start" "$end"
+}
+
+check_route_overlap() {
+  local selected_start selected_end
+  read -r selected_start selected_end < <(cidr_bounds "$OCSERV_IPV4_NETWORK")
+  local line dest route_start route_end
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    dest="${line%% *}"
+    [[ "$dest" == "default" ]] && continue
+    read -r route_start route_end < <(cidr_bounds "$dest")
+    if ((selected_start <= route_end && route_start <= selected_end)); then
+      die "OCSERV_IPV4_NETWORK ${OCSERV_IPV4_NETWORK} overlaps existing route: $dest"
+    fi
+  done < <(ip -4 route show table main type unicast)
+}
+
+_configured_ocserv_port() {
+  is_managed_file "$OCSERV_CONF" || return 1
+  awk -F' = ' '$1 == "tcp-port" { print $2; found=1 } END { exit !found }' "$OCSERV_CONF"
+}
+
+check_port_available() {
+  local configured_port="" managed_rerun=0
+  if configured_port="$(_configured_ocserv_port)"; then
+    managed_rerun=1
+  fi
+  local listeners
+  listeners="$( { ss -H -ltnp "sport = :${OCSERV_PORT}"; ss -H -lunp "sport = :${OCSERV_PORT}"; } 2>/dev/null )"
+  [[ -z "$listeners" ]] && return 0
+  if ((managed_rerun)) && [[ "$OCSERV_PORT" == "$configured_port" ]]; then
+    local line procs other
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      procs="$(grep -oP '"\K[^"]+(?=")' <<<"$line")"
+      [[ -n "$procs" ]] || die "cannot determine process owning port ${OCSERV_PORT}"
+      other="$(printf '%s\n' "$procs" | grep -v '^ocserv$' || true)"
+      [[ -z "$other" ]] ||
+        die "port ${OCSERV_PORT} is held by another process: $other"
+    done <<<"$listeners"
+    return 0
+  fi
+  die "port ${OCSERV_PORT} is already in use"
+}
+
+test_ocserv_config() {
+  local temp_conf="$1"
+  ocserv -c "$temp_conf" --test-config
 }
 
 # ==================== User management ====================
