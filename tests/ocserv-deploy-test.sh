@@ -615,6 +615,41 @@ test_read_confirmed_password_empty_rejected() {
   ((rc != 0)) || fail "empty password must be rejected"
 }
 
+test_set_user_password_clears_password_on_failure() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  cat >"$TEST_ROOT/bin/ocpasswd" <<'MOCK_EOF'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 1
+MOCK_EOF
+  chmod +x "$TEST_ROOT/bin/ocpasswd"
+  local passwd_file="$TEST_ROOT/ocpasswd"
+  install -m 0600 /dev/null "$passwd_file"
+  local result_file="$TEST_ROOT/pw_state"
+
+  # Run set_user_password in a fresh shell where set -e is genuinely
+  # active so the production bug (early exit leaving CONFIRMED_PASSWORD
+  # set) is visible via the EXIT trap.
+  local rc=0
+  TEST_ROOT="$TEST_ROOT" REPO_ROOT="$REPO_ROOT" RESULT_FILE="$result_file" \
+    PATH="$TEST_ROOT/bin:$PATH" OCSERV_DEPLOY_ROOT="$OCSERV_DEPLOY_ROOT" \
+    bash <<'SUBSH' || rc=$?
+set -Eeuo pipefail
+OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/ocserv-deploy.sh"
+CONFIRMED_PASSWORD="topsecret"
+trap 'printf "${CONFIRMED_PASSWORD+still_set}" > "${RESULT_FILE}"' EXIT
+set_user_password alice "$TEST_ROOT/ocpasswd"
+SUBSH
+
+  ((rc != 0)) || fail "set_user_password must propagate nonzero exit from ocpasswd"
+  [[ -f "$result_file" ]] || fail "EXIT trap did not write result file"
+  local pw_state
+  pw_state="$(cat "$result_file")"
+  [[ -z "$pw_state" ]] ||
+    fail "CONFIRMED_PASSWORD must be cleared after ocpasswd failure (EXIT trap saw: still_set)"
+}
+
 test_add_user_no_password_in_args() {
   new_fixture
   trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -626,10 +661,10 @@ test_add_user_no_password_in_args() {
   add_user "alice" "$passwd_file" < <(printf 'secretpassword\nsecretpassword\n')
   grep -q '^alice:' "$passwd_file" ||
     fail "user alice was not added to password file"
-  if [[ -f "$TEST_ROOT/ocpasswd-args.log" ]] &&
-     grep -qF "secretpassword" "$TEST_ROOT/ocpasswd-args.log"; then
-    fail "password must not appear in ocpasswd arguments"
-  fi
+  [[ -f "$TEST_ROOT/ocpasswd-args.log" ]] ||
+    fail "ocpasswd-args.log must exist — mock ocpasswd was not invoked"
+  grep -qF "secretpassword" "$TEST_ROOT/ocpasswd-args.log" &&
+    fail "password must not appear in ocpasswd arguments" || true
 }
 
 test_add_user_duplicate_rejected() {
@@ -710,6 +745,7 @@ run_test "rejects colon in username" test_validate_username_rejects_colon
 run_test "rejects username over 64 chars" test_validate_username_rejects_over_64_chars
 run_test "password mismatch rejected" test_read_confirmed_password_mismatch_rejected
 run_test "empty password rejected" test_read_confirmed_password_empty_rejected
+run_test "ocpasswd failure clears password" test_set_user_password_clears_password_on_failure
 run_test "add-user no password in args" test_add_user_no_password_in_args
 run_test "add-user duplicate rejected" test_add_user_duplicate_rejected
 run_test "delete existing user" test_delete_user_existing

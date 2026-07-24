@@ -261,9 +261,11 @@ set_user_password() {
   local username="$1"
   local password_file="${2:-$OCSERV_PASSWD}"
   [[ -f "$password_file" ]] || install -m 0600 /dev/null "$password_file"
+  local rc=0
   printf '%s\n%s\n' "$CONFIRMED_PASSWORD" "$CONFIRMED_PASSWORD" |
-    ocpasswd -c "$password_file" "$username"
+    ocpasswd -c "$password_file" "$username" || rc=$?
   unset CONFIRMED_PASSWORD
+  return $rc
 }
 
 add_user() {
