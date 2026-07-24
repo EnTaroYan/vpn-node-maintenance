@@ -376,6 +376,113 @@ OCSERV_CERT_MODE="selfsigned"
     fail "self-signed mode must not create a certbot hook"
 }
 
+
+# ---------- Fix 1: prepare_certificate must reject unsupported modes ----------
+
+test_prepare_certificate_unknown_mode_fails() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  OCSERV_CERT_MODE="custom"
+  assert_failure prepare_certificate
+}
+
+# ---------- Fix 2: generate_self_signed_certificate must clean up on failure --
+
+test_generate_selfsigned_cleans_up_on_failure() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  source_deployer
+  load_config
+  validate_common_config
+  # Force a late failure inside generate_self_signed_certificate so temp files
+  # are already created when the function aborts.
+  certificate_matches_endpoint() { return 1; }
+  assert_failure generate_self_signed_certificate
+  local ssl_dir leftover
+  ssl_dir="$(dirname "$SELF_SIGNED_CERT")"
+  leftover="$(find "$ssl_dir" -maxdepth 1 \( -name '.cert.*' -o -name '.key.*' \) 2>/dev/null | wc -l)"
+  ((leftover == 0)) || fail "temp cert/key files were not cleaned up after failure (found $leftover)"
+}
+
+# ---------- Fix 3: self-signed mode must mark managed hook for deletion -------
+
+test_selfsigned_marks_managed_hook_for_deletion() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  source_deployer
+  load_config
+  validate_common_config
+  install -d -m 0755 "$(dirname "$CERT_HOOK")"
+  # Create a managed hook (contains MANAGED_MARKER)
+  printf '#!/usr/bin/env bash\n%s\n' "$MANAGED_MARKER" >"$CERT_HOOK"
+  prepare_certificate
+  assert_eq "1" "${CERT_HOOK_DELETE:-}" "CERT_HOOK_DELETE must be 1 when a managed hook exists"
+}
+
+test_selfsigned_does_not_mark_unmanaged_hook() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  source_deployer
+  load_config
+  validate_common_config
+  install -d -m 0755 "$(dirname "$CERT_HOOK")"
+  # Create an unmanaged hook (no MANAGED_MARKER)
+  printf '#!/usr/bin/env bash\n# Custom hook\n' >"$CERT_HOOK"
+  prepare_certificate
+  [[ -z "${CERT_HOOK_DELETE:-}" ]] ||
+    fail "unmanaged hook must not be marked for deletion"
+}
+
+# ---------- Fix 4: certificate_matches_endpoint must propagate genuine errors -
+# RED: current code returns 1 (from [[...]] fallthrough) instead of the real
+#      OpenSSL exit code when openssl fails for a reason unrelated to mismatch.
+# GREEN: with || rc=$? + result-text check, the genuine exit code is returned.
+
+test_certificate_matches_endpoint_propagates_genuine_error() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  source_deployer
+  local cert_dir="$TEST_ROOT/certs"
+  install -d -m 0755 "$cert_dir"
+  _generate_test_cert "vpn.example.com" "$cert_dir/cert.pem" "$cert_dir/key.pem"
+  # Fake openssl: for -checkhost/-checkip, exit 2 with no match text on stdout
+  # (simulates a genuine OpenSSL error, not a simple mismatch).
+  cat >"$TEST_ROOT/bin/openssl" <<'FAKE_EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *-checkhost* || "$*" == *-checkip* ]]; then
+  printf 'could not read certificate\n' >&2
+  exit 2
+fi
+exec /usr/bin/openssl "$@"
+FAKE_EOF
+  chmod +x "$TEST_ROOT/bin/openssl"
+  local rc=0
+  PATH="$TEST_ROOT/bin:$PATH" certificate_matches_endpoint "$cert_dir/cert.pem" "vpn.example.com" || rc=$?
+  assert_eq "2" "$rc" "genuine OpenSSL error exit code must be propagated (not 1)"
+}
+
 run_test "valid common config" test_valid_common_config
 run_test "invalid port" test_rejects_invalid_port
 run_test "self-signed without DDNS" test_selfsigned_does_not_require_ddns_or_certbot_fields
@@ -391,4 +498,9 @@ run_test "Lets Encrypt expired cert fails" test_letsencrypt_expired_cert_fails
 run_test "Lets Encrypt endpoint mismatch fails" test_letsencrypt_endpoint_mismatch_fails
 run_test "render certbot hook" test_render_certbot_hook
 run_test "self-signed no hook created" test_selfsigned_no_hook_created
+run_test "prepare certificate unknown mode fails" test_prepare_certificate_unknown_mode_fails
+run_test "generate selfsigned cleans up on failure" test_generate_selfsigned_cleans_up_on_failure
+run_test "selfsigned marks managed hook for deletion" test_selfsigned_marks_managed_hook_for_deletion
+run_test "selfsigned does not mark unmanaged hook" test_selfsigned_does_not_mark_unmanaged_hook
+run_test "certificate matches endpoint propagates genuine error" test_certificate_matches_endpoint_propagates_genuine_error
 finish_tests

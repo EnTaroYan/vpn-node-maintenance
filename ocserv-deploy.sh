@@ -20,6 +20,7 @@ OCSERV_NETWORK_ADDRESS=""
 OCSERV_NETMASK=""
 SERVER_CERT_FILE=""
 SERVER_KEY_FILE=""
+CERT_HOOK_DELETE=""
 
 log() {
   printf '%s [ocserv-deploy] %s\n' "$(date --iso-8601=seconds)" "$*"
@@ -131,35 +132,47 @@ validate_certificate_pair() {
 }
 
 certificate_matches_endpoint() {
-  local cert="$1" endpoint="$2" result
+  local cert="$1" endpoint="$2" result rc=0
   if valid_ipv4 "$endpoint"; then
-    result="$(openssl x509 -in "$cert" -noout -checkip "$endpoint" 2>/dev/null)"
+    result="$(openssl x509 -in "$cert" -noout -checkip "$endpoint" 2>/dev/null)" || rc=$?
   else
-    result="$(openssl x509 -in "$cert" -noout -checkhost "$endpoint" 2>/dev/null)"
+    result="$(openssl x509 -in "$cert" -noout -checkhost "$endpoint" 2>/dev/null)" || rc=$?
   fi
-  # OpenSSL 3.x -checkhost/-checkip always exits 0; distinguish via output text
-  [[ "$result" == *"does match"* ]]
+  # OpenSSL 3.0: exits 0; "does [NOT] match" text distinguishes match/mismatch.
+  # OpenSSL 3.2+: exits 0 on match, 1 on mismatch; same text output.
+  # Unrelated errors produce no match text and a nonzero exit code — propagate.
+  if [[ "$result" == *"does NOT match"* ]]; then
+    return 1
+  elif [[ "$result" == *"does match"* ]]; then
+    return 0
+  elif ((rc != 0)); then
+    return "$rc"
+  else
+    return 1
+  fi
 }
 
 generate_self_signed_certificate() {
   install -d -m 0700 "$(dirname "$SELF_SIGNED_CERT")"
-  local temp_cert temp_key san_type
-  temp_cert="$(mktemp "$(dirname "$SELF_SIGNED_CERT")/.cert.XXXXXX")"
-  temp_key="$(mktemp "$(dirname "$SELF_SIGNED_KEY")/.key.XXXXXX")"
-  san_type="DNS"
-  valid_ipv4 "$OCSERV_ENDPOINT" && san_type="IP"
-  openssl req -x509 -newkey rsa:3072 -nodes -sha256 -days 3650 \
-    -subj "/CN=${OCSERV_ENDPOINT}" \
-    -addext "subjectAltName=${san_type}:${OCSERV_ENDPOINT}" \
-    -keyout "$temp_key" -out "$temp_cert"
-  chmod 0600 "$temp_key"
-  chmod 0644 "$temp_cert"
-  validate_certificate_pair "$temp_cert" "$temp_key"
-  certificate_matches_endpoint "$temp_cert" "$OCSERV_ENDPOINT" ||
-    die "generated certificate SAN does not match endpoint"
-  install -m 0600 "$temp_key" "$SELF_SIGNED_KEY"
-  install -m 0644 "$temp_cert" "$SELF_SIGNED_CERT"
-  rm -f -- "$temp_cert" "$temp_key"
+  # Run all temp-file work in a subshell so the EXIT trap cannot leak to callers.
+  (
+    temp_cert="$(mktemp "$(dirname "$SELF_SIGNED_CERT")/.cert.XXXXXX")"
+    temp_key="$(mktemp "$(dirname "$SELF_SIGNED_KEY")/.key.XXXXXX")"
+    trap 'rm -f -- "$temp_cert" "$temp_key"' EXIT
+    san_type="DNS"
+    valid_ipv4 "$OCSERV_ENDPOINT" && san_type="IP"
+    openssl req -x509 -newkey rsa:3072 -nodes -sha256 -days 3650 \
+      -subj "/CN=${OCSERV_ENDPOINT}" \
+      -addext "subjectAltName=${san_type}:${OCSERV_ENDPOINT}" \
+      -keyout "$temp_key" -out "$temp_cert"
+    chmod 0600 "$temp_key"
+    chmod 0644 "$temp_cert"
+    validate_certificate_pair "$temp_cert" "$temp_key"
+    certificate_matches_endpoint "$temp_cert" "$OCSERV_ENDPOINT" ||
+      die "generated certificate SAN does not match endpoint"
+    install -m 0600 "$temp_key" "$SELF_SIGNED_KEY"
+    install -m 0644 "$temp_cert" "$SELF_SIGNED_CERT"
+  )
 }
 
 prepare_selfsigned_certificate() {
@@ -174,6 +187,9 @@ prepare_selfsigned_certificate() {
   fi
   SERVER_CERT_FILE="$SELF_SIGNED_CERT"
   SERVER_KEY_FILE="$SELF_SIGNED_KEY"
+  if [[ -f "$CERT_HOOK" ]] && grep -qF "$MANAGED_MARKER" "$CERT_HOOK"; then
+    CERT_HOOK_DELETE=1
+  fi
 }
 
 prepare_letsencrypt_certificate() {
@@ -190,6 +206,7 @@ prepare_certificate() {
   case "$OCSERV_CERT_MODE" in
     selfsigned) prepare_selfsigned_certificate ;;
     letsencrypt) prepare_letsencrypt_certificate ;;
+    *) die "unsupported OCSERV_CERT_MODE: ${OCSERV_CERT_MODE}" ;;
   esac
 }
 
