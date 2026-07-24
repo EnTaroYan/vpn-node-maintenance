@@ -1,0 +1,17 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+vpn-maintenance.env
+cloudflare-acme.ini
+
+# Certificates and private keys
+*.crt
+*.key
+*.p12
+*.pem
+
+# Editor and temporary files
+*~
+*.swp
+.DS_Store

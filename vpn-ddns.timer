@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically update the Cloudflare VPN DDNS record
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Unit=vpn-ddns.service
+
+[Install]
+WantedBy=timers.target
