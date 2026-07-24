@@ -57,7 +57,9 @@ source_deployer() {
 # or apply the vpn_node_ocserv nftables table on the real host.
 test_real_tools_staged_validation() {
   new_fixture
-  trap 'rm -rf -- "$TEST_ROOT/stage"; remove_fixture' EXIT
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  # Record TEST_ROOT so the --real-tools driver can assert cleanup after exit.
+  [[ -z "${_RT_CLEANUP_FILE:-}" ]] || printf '%s' "$TEST_ROOT" >"$_RT_CLEANUP_FILE"
   write_config '
 OCSERV_ENDPOINT="104.46.217.92"
 OCSERV_PORT="18443"
@@ -93,8 +95,21 @@ OCSERV_CERT_MODE="selfsigned"
 }
 
 if ((REAL_TOOLS_MODE)); then
+  # Pass a temp file so test_real_tools_staged_validation can record its
+  # TEST_ROOT; we verify the file is gone after the test exits.
+  _rt_cleanup_file="$(mktemp)"
+  export _RT_CLEANUP_FILE="$_rt_cleanup_file"
   run_test "real-tools staged validation (real ocserv/nft/ip, no start/apply)" \
     test_real_tools_staged_validation
+  _rt_root="$(cat "$_rt_cleanup_file" 2>/dev/null || true)"
+  rm -f -- "$_rt_cleanup_file"
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [[ -n "$_rt_root" && ! -e "$_rt_root" ]]; then
+    printf 'PASS: cleanup: %s removed\n' "$_rt_root"
+  elif [[ -n "$_rt_root" ]]; then
+    printf 'FAIL: cleanup: %s still exists after EXIT trap\n' "$_rt_root" >&2
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+  fi
   finish_tests
   exit $?
 fi
