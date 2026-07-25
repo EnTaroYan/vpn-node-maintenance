@@ -115,9 +115,10 @@ SoftEther 自动部署脚本尚未实现。计划使用 443，并与 ocserv 使�
 
 ```bash
 systemctl status vpn-ddns.timer certbot.timer ocserv.service
-journalctl -u vpn-ddns.service -u ocserv.service -e
-sudo ss -H -ltnp "sport = :8443"
-sudo ss -H -lunp "sport = :8443"
+sudo journalctl -u vpn-ddns.service -u ocserv.service -e
+PORT=8443  # replace with your OCSERV_PORT
+sudo ss -H -ltnp "sport = :${PORT}"
+sudo ss -H -lunp "sport = :${PORT}"
 sudo nft list table ip vpn_node_ocserv
 ```
 

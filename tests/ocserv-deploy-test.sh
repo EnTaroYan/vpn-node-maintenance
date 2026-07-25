@@ -849,7 +849,7 @@ test_add_user_no_password_in_args() {
   grep -q '^alice:' "$passwd_file" ||
     fail "user alice was not added to password file"
   [[ -f "$TEST_ROOT/ocpasswd-args.log" ]] ||
-    fail "ocpasswd-args.log must exist — mock ocpasswd was not invoked"
+    fail "ocpasswd-args.log must exist -- mock ocpasswd was not invoked"
   grep -qF "secretpassword" "$TEST_ROOT/ocpasswd-args.log" &&
     fail "password must not appear in ocpasswd arguments" || true
 }
@@ -1910,7 +1910,7 @@ run_test "systemd drop-in contents" test_render_systemd_dropin_contents
 # ==================== Task 6: Transactional Installer and Service Verification ====================
 
 # Writes the full set of system-command mocks used by the orchestration
-# tests. Every real system command (apt-get, dpkg, systemctl, ss, ip, nft,
+# tests. Every real system command (apt-get, systemctl, ss, ip, nft,
 # sysctl, ocserv, ocpasswd) is intercepted under $TEST_ROOT/bin so no test
 # ever touches real packages, services, sockets, or the host firewall.
 _write_orch_mocks() {

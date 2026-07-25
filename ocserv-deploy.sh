@@ -167,7 +167,7 @@ certificate_matches_endpoint() {
   fi
   # OpenSSL 3.0: exits 0; "does [NOT] match" text distinguishes match/mismatch.
   # OpenSSL 3.2+: exits 0 on match, 1 on mismatch; same text output.
-  # Unrelated errors produce no match text and a nonzero exit code — propagate.
+  # Unrelated errors produce no match text and a nonzero exit code -- propagate.
   if [[ "$result" == *"does NOT match"* ]]; then
     return 1
   elif [[ "$result" == *"does match"* ]]; then
