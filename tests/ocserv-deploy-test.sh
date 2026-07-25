@@ -849,7 +849,7 @@ test_add_user_no_password_in_args() {
   grep -q '^alice:' "$passwd_file" ||
     fail "user alice was not added to password file"
   [[ -f "$TEST_ROOT/ocpasswd-args.log" ]] ||
-    fail "ocpasswd-args.log must exist â€” mock ocpasswd was not invoked"
+    fail "ocpasswd-args.log must exist — mock ocpasswd was not invoked"
   grep -qF "secretpassword" "$TEST_ROOT/ocpasswd-args.log" &&
     fail "password must not appear in ocpasswd arguments" || true
 }
@@ -1909,14 +1909,6 @@ run_test "systemd drop-in contents" test_render_systemd_dropin_contents
 
 # ==================== Task 6: Transactional Installer and Service Verification ====================
 
-_write_os_release() {
-  local id="$1" version="$2"
-  cat >"$TEST_ROOT/os-release" <<EOF
-ID=${id}
-VERSION_ID="${version}"
-EOF
-}
-
 # Writes the full set of system-command mocks used by the orchestration
 # tests. Every real system command (apt-get, dpkg, systemctl, ss, ip, nft,
 # sysctl, ocserv, ocpasswd) is intercepted under $TEST_ROOT/bin so no test
@@ -1932,11 +1924,6 @@ fi
 exit 0
 MOCK_EOF
 
-  cat >"$TEST_ROOT/bin/dpkg" <<'MOCK_EOF'
-#!/usr/bin/env bash
-[[ "$1" == "--print-architecture" ]] && { printf '%s\n' "${MOCK_ARCH:-amd64}"; exit 0; }
-exit 0
-MOCK_EOF
 
   cat >"$TEST_ROOT/bin/systemctl" <<'MOCK_EOF'
 #!/usr/bin/env bash
@@ -1999,8 +1986,7 @@ MOCK_EOF
 
 # Sets up a fully validated config plus every system-command mock. The
 # optional second argument injects extra config lines (e.g. Let's Encrypt
-# fields). Leaves PATH pointing at the mock bin and OS_RELEASE_FILE at a
-# supported Ubuntu 24.04 fixture.
+# fields). Leaves PATH pointing at the mock bin with valid shared config.
 _orchestration_fixture() {
   local cert_mode="${1:-selfsigned}" extra="${2:-}"
   write_config "
@@ -2015,9 +2001,7 @@ ${extra}
   load_config
   validate_common_config
   _write_orch_mocks
-  _write_os_release ubuntu 24.04
   mkdir -p "$TEST_ROOT/ctl"
-  OS_RELEASE_FILE="$TEST_ROOT/os-release"
   export PATH="$TEST_ROOT/bin:$PATH"
 }
 
@@ -2035,13 +2019,6 @@ _seed_prior_managed_files() {
 
 # ---------- platform and dependency installation ----------
 
-test_install_dependencies_supported_platform_succeeds() {
-  new_fixture
-  trap 'rm -rf -- "$TEST_ROOT"' EXIT
-  _orchestration_fixture selfsigned
-  assert_success install_dependencies
-}
-
 test_install_dependencies_installs_exact_packages() {
   new_fixture
   trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -2056,37 +2033,18 @@ test_install_dependencies_installs_exact_packages() {
   return "$ok"
 }
 
-test_install_dependencies_unsupported_id_fails_before_apt() {
-  new_fixture
-  trap 'rm -rf -- "$TEST_ROOT"' EXIT
-  _orchestration_fixture selfsigned
-  _write_os_release debian 12
-  assert_failure install_dependencies
-  [[ ! -f "$TEST_ROOT/apt-get-args.log" ]] ||
-    fail "apt-get must not run for an unsupported OS ID"
-}
 
-test_install_dependencies_unsupported_version_fails_before_apt() {
+test_install_dependencies_uses_apt_directly() {
   new_fixture
   trap 'rm -rf -- "$TEST_ROOT"' EXIT
   _orchestration_fixture selfsigned
-  _write_os_release ubuntu 20.04
-  assert_failure install_dependencies
-  [[ ! -f "$TEST_ROOT/apt-get-args.log" ]] ||
-    fail "apt-get must not run for an unsupported Ubuntu version"
-}
-
-test_install_dependencies_unsupported_arch_fails_before_apt() {
-  new_fixture
-  trap 'rm -rf -- "$TEST_ROOT"' EXIT
-  _orchestration_fixture selfsigned
-  export MOCK_ARCH="armhf"
-  local rc=0
-  assert_failure install_dependencies || rc=1
-  unset MOCK_ARCH
-  [[ ! -f "$TEST_ROOT/apt-get-args.log" ]] ||
-    { fail "apt-get must not run for an unsupported architecture"; rc=1; }
-  return "$rc"
+  assert_success install_dependencies
+  grep -qFx 'ARGS: update' "$TEST_ROOT/apt-get-args.log" ||
+    fail "apt-get update must run without OS metadata"
+  grep -qFx \
+    'ARGS: install -y --no-install-recommends ocserv nftables openssl iproute2 util-linux' \
+    "$TEST_ROOT/apt-get-args.log" ||
+    fail "dependency install arguments changed"
 }
 
 # ---------- install lock ----------
@@ -2585,11 +2543,8 @@ test_install_refuses_unmanaged_hook_in_letsencrypt_mode() {
   return "$ok"
 }
 
-run_test "supported platform succeeds" test_install_dependencies_supported_platform_succeeds
 run_test "dependencies are the exact package set" test_install_dependencies_installs_exact_packages
-run_test "unsupported OS ID fails before apt" test_install_dependencies_unsupported_id_fails_before_apt
-run_test "unsupported Ubuntu version fails before apt" test_install_dependencies_unsupported_version_fails_before_apt
-run_test "unsupported architecture fails before apt" test_install_dependencies_unsupported_arch_fails_before_apt
+run_test "install dependencies uses apt directly" test_install_dependencies_uses_apt_directly
 run_test "install lock rejects concurrent runs" test_install_lock_rejects_concurrent_runs
 run_test "install preserves existing lock dir mode" test_install_preserves_existing_lock_dir_mode
 run_test "atomic install cleans temp on failure" test_atomic_install_cleans_temp_on_failure

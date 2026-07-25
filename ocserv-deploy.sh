@@ -22,8 +22,6 @@ SERVER_CERT_FILE=""
 SERVER_KEY_FILE=""
 CERT_HOOK_DELETE=""
 
-# Overridable so tests can point platform detection at a fixture file.
-OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
 
 # Root-only transaction workspace under /run (prefixed for test isolation).
 readonly TRANSACTION_DIR_ROOT="${ROOT_PREFIX}/run/ocserv-deploy"
@@ -169,7 +167,7 @@ certificate_matches_endpoint() {
   fi
   # OpenSSL 3.0: exits 0; "does [NOT] match" text distinguishes match/mismatch.
   # OpenSSL 3.2+: exits 0 on match, 1 on mismatch; same text output.
-  # Unrelated errors produce no match text and a nonzero exit code â€” propagate.
+  # Unrelated errors produce no match text and a nonzero exit code — propagate.
   if [[ "$result" == *"does NOT match"* ]]; then
     return 1
   elif [[ "$result" == *"does match"* ]]; then
@@ -661,37 +659,11 @@ ensure_initial_user() {
 
 # ==================== Platform and dependencies ====================
 
-_os_release_field() {
-  local key="$1" line
-  line="$(grep -E "^${key}=" "$OS_RELEASE_FILE" 2>/dev/null | tail -n1)" || true
-  line="${line#*=}"
-  line="${line%\"}"
-  line="${line#\"}"
-  printf '%s' "$line"
-}
-
-check_supported_platform() {
-  [[ -r "$OS_RELEASE_FILE" ]] || die "cannot read OS release file: $OS_RELEASE_FILE"
-  local os_id os_version arch
-  os_id="$(_os_release_field ID)"
-  os_version="$(_os_release_field VERSION_ID)"
-  [[ "$os_id" == "ubuntu" ]] ||
-    die "unsupported OS: ${os_id:-unknown} (requires Ubuntu)"
-  case "$os_version" in
-    22.04|24.04) ;;
-    *) die "unsupported Ubuntu version: ${os_version:-unknown} (requires 22.04 or 24.04)" ;;
-  esac
-  arch="$(dpkg --print-architecture)"
-  case "$arch" in
-    amd64|arm64) ;;
-    *) die "unsupported architecture: ${arch:-unknown} (requires amd64 or arm64)" ;;
-  esac
-}
-
 # Packages remain installed even if a later transactional step fails; the
 # rollback contract covers configuration state, not the package database.
 install_dependencies() {
-  check_supported_platform
+  command -v apt-get >/dev/null 2>&1 ||
+    die "required command not found: apt-get"
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ocserv nftables openssl iproute2 util-linux
