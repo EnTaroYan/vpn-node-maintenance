@@ -177,6 +177,25 @@ OCSERV_CERT_MODE="selfsigned"
   assert_failure validate_common_config
 }
 
+# ---------- Finding 6: endpoint hostname validation ----------
+# RED: valid_hostname currently accepts an all-numeric final label, so an
+#      IPv4-like string with an out-of-range octet (e.g. 10.20.30.999) passes
+#      validate_endpoint as a DNS name. GREEN: the all-numeric final label
+#      (TLD) is rejected, while real hostnames and IPs still validate.
+test_validate_endpoint_rejects_numeric_tld_ipv4like() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  source_deployer
+  local ok=0
+  assert_failure validate_endpoint "10.20.30.999" || ok=1
+  assert_failure valid_hostname "10.20.30.999" || ok=1
+  assert_failure valid_hostname "vpn.example.123" || ok=1
+  assert_success validate_endpoint "vpn.example.com" || ok=1
+  assert_success validate_endpoint "104.46.217.92" || ok=1
+  assert_success valid_hostname "a1.example.com" || ok=1
+  return "$ok"
+}
+
 # ---------- Certificate test helpers ----------
 
 _generate_test_cert() {
@@ -436,6 +455,8 @@ OCSERV_CERT_MODE="letsencrypt"
     fail "hook must compare RENEWED_LINEAGE"
   grep -q 'systemctl reload ocserv.service' "$hook_out" ||
     fail "hook must invoke systemctl reload ocserv.service"
+  grep -qFx "$MANAGED_MARKER" "$hook_out" ||
+    fail "hook must carry the exact management marker line"
 }
 
 test_selfsigned_no_hook_created() {
@@ -490,6 +511,89 @@ OCSERV_CERT_MODE="selfsigned"
   ssl_dir="$(dirname "$SELF_SIGNED_CERT")"
   leftover="$(find "$ssl_dir" -maxdepth 1 \( -name '.cert.*' -o -name '.key.*' \) 2>/dev/null | wc -l)"
   ((leftover == 0)) || fail "temp cert/key files were not cleaned up after failure (found $leftover)"
+}
+
+# ---------- Finding 2: a generation failure triggers exactly one rollback ----
+# RED: the self-signed generation subshell inherits the parent ERR trap (set
+#      -E), so a bare-command generation failure (e.g. failing openssl req)
+#      rolls back once inside the subshell AND again in the parent = double
+#      rollback. GREEN: "trap - ERR" inside the subshell leaves exactly one
+#      parent rollback. Runs in a fresh bash so set -e is genuinely active
+#      (run_test invokes each test in an if-condition, which disables set -e).
+test_generate_selfsigned_generation_failure_single_rollback() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  cat >"$TEST_ROOT/bin/openssl" <<'FAKE_EOF'
+#!/usr/bin/env bash
+[[ "$1" == "req" ]] && exit 1
+exec /usr/bin/openssl "$@"
+FAKE_EOF
+  chmod +x "$TEST_ROOT/bin/openssl"
+  local count_file="$TEST_ROOT/rollback-count"
+  : >"$count_file"
+  cat >"$TEST_ROOT/scenario.sh" <<'SCENARIO_EOF'
+#!/usr/bin/env bash
+export PATH="$TEST_ROOT/bin:$PATH"
+OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/ocserv-deploy.sh"
+load_config
+validate_common_config
+install -d -m 0700 "$(dirname "$SELF_SIGNED_CERT")"
+rollback_transaction() { printf 'R' >>"$COUNT_FILE"; exit "${1:-1}"; }
+TRANSACTION_ACTIVE=1
+trap 'rollback_transaction $?' ERR
+generate_self_signed_certificate
+SCENARIO_EOF
+  TEST_ROOT="$TEST_ROOT" REPO_ROOT="$REPO_ROOT" COUNT_FILE="$count_file" \
+    VPN_MAINTENANCE_CONFIG="$VPN_MAINTENANCE_CONFIG" \
+    OCSERV_DEPLOY_ROOT="$OCSERV_DEPLOY_ROOT" \
+    bash "$TEST_ROOT/scenario.sh" >/dev/null 2>&1 || true
+  local n
+  n="$(wc -c <"$count_file")"
+  assert_eq "1" "$n" "a self-signed generation failure must trigger exactly one rollback"
+}
+
+# ---------- Finding 3: second mktemp failure must not leak the first temp ----
+# RED: the EXIT cleanup trap is armed only after BOTH mktemp calls, so if the
+#      second mktemp fails the first temp file leaks. GREEN: cleanup is armed
+#      right after the first mktemp. Runs in a fresh bash so set -e is active.
+test_generate_selfsigned_second_mktemp_failure_no_leak() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  local ssl_dir="$OCSERV_DEPLOY_ROOT/etc/ocserv/ssl"
+  cat >"$TEST_ROOT/scenario.sh" <<'SCENARIO_EOF'
+#!/usr/bin/env bash
+OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/ocserv-deploy.sh"
+load_config
+validate_common_config
+install -d -m 0700 "$(dirname "$SELF_SIGNED_CERT")"
+mktemp() {
+  if [[ -f "$TEST_ROOT/mktemp-once" ]]; then return 1; fi
+  : >"$TEST_ROOT/mktemp-once"
+  command mktemp "$@"
+}
+generate_self_signed_certificate
+SCENARIO_EOF
+  TEST_ROOT="$TEST_ROOT" REPO_ROOT="$REPO_ROOT" \
+    VPN_MAINTENANCE_CONFIG="$VPN_MAINTENANCE_CONFIG" \
+    OCSERV_DEPLOY_ROOT="$OCSERV_DEPLOY_ROOT" \
+    bash "$TEST_ROOT/scenario.sh" >/dev/null 2>&1 || true
+  local leftover
+  leftover="$(find "$ssl_dir" -maxdepth 1 \( -name '.cert.*' -o -name '.key.*' \) 2>/dev/null | wc -l)"
+  ((leftover == 0)) || fail "first temp file leaked when the second mktemp failed (found $leftover)"
 }
 
 # ---------- Fix 3: self-signed mode must mark managed hook for deletion -------
@@ -567,6 +671,7 @@ run_test "valid common config" test_valid_common_config
 run_test "invalid port" test_rejects_invalid_port
 run_test "self-signed without DDNS" test_selfsigned_does_not_require_ddns_or_certbot_fields
 run_test "rejects scalar DNS" test_rejects_scalar_dns
+run_test "endpoint rejects numeric-TLD IPv4-like host" test_validate_endpoint_rejects_numeric_tld_ipv4like
 run_test "self-signed IP SAN" test_selfsigned_ip_san
 run_test "self-signed DNS SAN" test_selfsigned_dns_san
 run_test "self-signed reuse matching pair" test_selfsigned_reuse_matching_pair
@@ -580,6 +685,8 @@ run_test "render certbot hook" test_render_certbot_hook
 run_test "self-signed no hook created" test_selfsigned_no_hook_created
 run_test "prepare certificate unknown mode fails" test_prepare_certificate_unknown_mode_fails
 run_test "generate selfsigned cleans up on failure" test_generate_selfsigned_cleans_up_on_failure
+run_test "generation failure triggers single rollback" test_generate_selfsigned_generation_failure_single_rollback
+run_test "second mktemp failure leaves no temp" test_generate_selfsigned_second_mktemp_failure_no_leak
 run_test "selfsigned marks managed hook for deletion" test_selfsigned_marks_managed_hook_for_deletion
 run_test "selfsigned does not mark unmanaged hook" test_selfsigned_does_not_mark_unmanaged_hook
 run_test "certificate matches endpoint propagates genuine error" test_certificate_matches_endpoint_propagates_genuine_error
@@ -976,22 +1083,14 @@ test_check_existing_config_managed_accepted() {
   source_deployer
   install -d -m 0755 "$(dirname "$OCSERV_CONF")"
   printf '%s\n' "$MANAGED_MARKER" >"$OCSERV_CONF"
-  local ok=0
-  assert_success check_existing_config || ok=1
-  assert_eq "1" "$CONF_EXISTED_BEFORE_INSTALL" \
-    "CONF_EXISTED_BEFORE_INSTALL must be captured for pre-existing managed config" || ok=1
-  return "$ok"
+  assert_success check_existing_config
 }
 
 test_check_existing_config_absent_passes() {
   new_fixture
   trap remove_fixture EXIT
   source_deployer
-  local ok=0
-  assert_success check_existing_config || ok=1
-  assert_eq "0" "$CONF_EXISTED_BEFORE_INSTALL" \
-    "CONF_EXISTED_BEFORE_INSTALL must be 0 when no config existed before install" || ok=1
-  return "$ok"
+  assert_success check_existing_config
 }
 
 # ---------- check_port_available ----------
@@ -1150,7 +1249,87 @@ OCSERV_CERT_MODE="selfsigned"
   PATH="$TEST_ROOT/bin:$PATH" assert_success check_route_overlap
 }
 
-# ---------- test_ocserv_config ----------
+# ---------- Finding 4: ECMP nexthop continuation lines ----------
+# check_route_overlap only fails a malformed route under an active set -e (an
+# empty read hits EOF and aborts), but run_test invokes each test in an
+# if-condition, which disables set -e. So these two tests run the function in a
+# fresh bash where set -e is genuinely active and assert on the exit code.
+#
+# RED: an ECMP multipath route renders an indented "nexthop ..." continuation
+#      line per path; the parser treated it as a route destination and aborted
+#      "invalid IPv4 address in route". GREEN: nexthop continuation lines are
+#      skipped, so a valid ECMP default route no longer aborts install.
+_write_route_overlap_scenario() {
+  cat >"$TEST_ROOT/scenario.sh" <<'SCENARIO_EOF'
+#!/usr/bin/env bash
+export PATH="$TEST_ROOT/bin:$PATH"
+OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/ocserv-deploy.sh"
+load_config
+validate_common_config
+check_route_overlap
+SCENARIO_EOF
+}
+
+_run_route_overlap_scenario() {
+  TEST_ROOT="$TEST_ROOT" REPO_ROOT="$REPO_ROOT" \
+    VPN_MAINTENANCE_CONFIG="$VPN_MAINTENANCE_CONFIG" \
+    OCSERV_DEPLOY_ROOT="$OCSERV_DEPLOY_ROOT" \
+    bash "$TEST_ROOT/scenario.sh" >/dev/null 2>&1
+}
+
+test_check_route_overlap_skips_ecmp_nexthop_lines() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  {
+    printf '%s\n' 'default proto static'
+    printf '\tnexthop via 172.16.0.1 dev eth0 weight 1\n'
+    printf '\tnexthop via 172.16.0.2 dev eth1 weight 1\n'
+    printf '%s\n' '172.16.0.0/24 dev eth0 proto kernel scope link src 172.16.0.4 metric 100'
+  } >"$TEST_ROOT/mock_routes.txt"
+  cat >"$TEST_ROOT/bin/ip" <<MOCK_EOF
+#!/usr/bin/env bash
+cat "$TEST_ROOT/mock_routes.txt"
+MOCK_EOF
+  chmod +x "$TEST_ROOT/bin/ip"
+  _write_route_overlap_scenario
+  local rc=0
+  _run_route_overlap_scenario || rc=$?
+  assert_eq "0" "$rc" "a valid ECMP default route must not abort check_route_overlap"
+}
+
+# Regression guard: a genuinely malformed, unrelated route destination (not an
+# ECMP nexthop continuation) must still fail closed after the ECMP skip fix.
+test_check_route_overlap_malformed_destination_still_fails() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  write_config '
+OCSERV_ENDPOINT="vpn.example.com"
+OCSERV_PORT="8443"
+OCSERV_IPV4_NETWORK="10.66.0.0/24"
+OCSERV_DNS=("8.8.4.4")
+OCSERV_CERT_MODE="selfsigned"
+'
+  {
+    printf '%s\n' 'default via 172.16.0.1 dev eth0 proto dhcp src 172.16.0.4 metric 100'
+    printf '%s\n' 'not-a-valid-destination dev eth0 scope link'
+  } >"$TEST_ROOT/mock_routes.txt"
+  cat >"$TEST_ROOT/bin/ip" <<MOCK_EOF
+#!/usr/bin/env bash
+cat "$TEST_ROOT/mock_routes.txt"
+MOCK_EOF
+  chmod +x "$TEST_ROOT/bin/ip"
+  _write_route_overlap_scenario
+  local rc=0
+  _run_route_overlap_scenario || rc=$?
+  ((rc != 0)) || fail "a malformed, unrelated route destination must still fail check_route_overlap"
+}
 
 _write_mock_ocserv_cli() {
   cat >"$TEST_ROOT/bin/ocserv" <<'MOCK_EOF'
@@ -1192,6 +1371,8 @@ run_test "managed rerun port change conflict fails" test_check_port_available_ma
 run_test "managed rerun same port non-ocserv owner fails" test_check_port_available_managed_rerun_same_port_non_ocserv_owner_fails
 run_test "route overlap conflict fails" test_check_route_overlap_conflict_fails
 run_test "route overlap unrelated route passes" test_check_route_overlap_unrelated_passes
+run_test "route overlap skips ECMP nexthop lines" test_check_route_overlap_skips_ecmp_nexthop_lines
+run_test "route overlap malformed destination fails" test_check_route_overlap_malformed_destination_still_fails
 run_test "test_ocserv_config invokes ocserv --test-config" test_test_ocserv_config_invokes_test_config
 
 # ==================== Task 5: nftables Helper and systemd Lifecycle ====================
@@ -1466,6 +1647,32 @@ test_render_network_helper_up_replaces_owned_table() {
   return "$ok"
 }
 
+# ---------- Finding 5: up validates the ruleset before deleting ----------
+# RED: cmd_up deleted the owned active table before validating the new
+#      ruleset, so a bad ruleset could tear down the live table with nothing
+#      to replace it. GREEN: a non-applying "nft --check -f" runs before the
+#      "nft delete table" of the owned active table.
+test_render_network_helper_up_checks_ruleset_before_deleting_owned_table() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _network_helper_fixture
+  _seed_owned_table
+  local helper; helper="$(_render_helper)"
+  PATH="$TEST_ROOT/bin:$PATH" assert_success "$helper" up
+  local check_line delete_line ok=0
+  check_line="$(grep -n '^ARGS: --check -f' "$TEST_ROOT/nft-args.log" | head -1 | cut -d: -f1)"
+  delete_line="$(grep -n '^ARGS: delete table ip vpn_node_ocserv' "$TEST_ROOT/nft-args.log" | head -1 | cut -d: -f1)"
+  [[ -n "$check_line" ]] ||
+    { fail "up must run a non-applying nft --check before deleting the owned table"; ok=1; }
+  [[ -n "$delete_line" ]] ||
+    { fail "up must delete the previously owned table"; ok=1; }
+  if [[ -n "$check_line" && -n "$delete_line" ]] && ((check_line >= delete_line)); then
+    fail "nft --check must run before deleting the owned active table (check@${check_line} delete@${delete_line})"
+    ok=1
+  fi
+  return "$ok"
+}
+
 test_render_network_helper_down_absent_table_succeeds() {
   new_fixture
   trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -1687,6 +1894,7 @@ run_test "no INPUT chain or DROP policy" test_render_network_helper_no_input_cha
 run_test "table contains sentinel chain" test_render_network_helper_table_contains_sentinel_chain
 run_test "uses configured subnet, not hardcoded" test_render_network_helper_uses_configured_subnet_not_hardcoded
 run_test "up replaces an owned table" test_render_network_helper_up_replaces_owned_table
+run_test "up checks ruleset before deleting owned table" test_render_network_helper_up_checks_ruleset_before_deleting_owned_table
 run_test "down succeeds when table is absent" test_render_network_helper_down_absent_table_succeeds
 run_test "down deletes an owned table" test_render_network_helper_down_deletes_owned_table
 run_test "down never resets ip_forward" test_render_network_helper_down_never_resets_ip_forward
@@ -1894,6 +2102,51 @@ test_install_lock_rejects_concurrent_runs() {
   ( main install ) </dev/null >/dev/null 2>&1 || rc=$?
   exec 8>&-
   ((rc != 0)) || fail "a concurrent install must be rejected while the lock is held"
+}
+
+# ---------- Finding 1: install must not chmod a pre-existing lock dir --------
+# RED: main install used "install -d -m 0755 $(dirname INSTALL_LOCK)", which
+#      chmods an already-existing /run/lock from its sticky 1777 to 0755.
+#      GREEN: "mkdir -p" leaves a pre-existing directory's mode untouched.
+test_install_preserves_existing_lock_dir_mode() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  touch "$TEST_ROOT/ctl/is_active"
+  local lock_dir; lock_dir="$(dirname "$INSTALL_LOCK")"
+  install -d "$lock_dir"
+  chmod 1777 "$lock_dir"
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 ||
+    { fail "install must succeed"; return 1; }
+  local mode; mode="$(stat -c '%a' "$lock_dir")"
+  assert_eq "1777" "$mode" \
+    "install must not chmod a pre-existing lock directory (preserve /run/lock 1777)"
+}
+
+# ---------- Finding 7: atomic install must not leak its temp on failure ------
+# RED: _atomic_install_file created a same-directory temp then ran install/mv;
+#      if install (or mv) failed the temp file was left behind. GREEN: the
+#      temp is removed before the failure propagates. Runs in a fresh bash so
+#      set -e genuinely aborts at the failing install.
+test_atomic_install_cleans_temp_on_failure() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  local dir="$OCSERV_DEPLOY_ROOT/atomic-dest"
+  install -d -m 0755 "$dir"
+  cat >"$TEST_ROOT/scenario.sh" <<'SCENARIO_EOF'
+#!/usr/bin/env bash
+OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/ocserv-deploy.sh"
+_atomic_install_file 0644 "$MISSING_SRC" "$DEST"
+SCENARIO_EOF
+  REPO_ROOT="$REPO_ROOT" OCSERV_DEPLOY_ROOT="$OCSERV_DEPLOY_ROOT" \
+    MISSING_SRC="$TEST_ROOT/does-not-exist-src" DEST="$dir/target" \
+    bash "$TEST_ROOT/scenario.sh" >/dev/null 2>&1
+  local rc=$? ok=0
+  ((rc != 0)) || { fail "_atomic_install_file must fail when the source is missing"; ok=1; }
+  local leftover
+  leftover="$(find "$dir" -maxdepth 1 -name '.ocserv-deploy.*' 2>/dev/null | wc -l)"
+  ((leftover == 0)) || { fail "atomic install must not leak its temp file on failure (found $leftover)"; ok=1; }
+  return "$ok"
 }
 
 # ---------- staging, validation, and atomic replacement ----------
@@ -2338,6 +2591,8 @@ run_test "unsupported OS ID fails before apt" test_install_dependencies_unsuppor
 run_test "unsupported Ubuntu version fails before apt" test_install_dependencies_unsupported_version_fails_before_apt
 run_test "unsupported architecture fails before apt" test_install_dependencies_unsupported_arch_fails_before_apt
 run_test "install lock rejects concurrent runs" test_install_lock_rejects_concurrent_runs
+run_test "install preserves existing lock dir mode" test_install_preserves_existing_lock_dir_mode
+run_test "atomic install cleans temp on failure" test_atomic_install_cleans_temp_on_failure
 run_test "first install replaces package default" test_first_install_replaces_package_default
 run_test "config validated in staging before replacement" test_install_validates_staged_config_before_replacement
 run_test "empty database creates initial user" test_install_empty_db_creates_initial_user

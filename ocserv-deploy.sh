@@ -21,7 +21,6 @@ OCSERV_NETMASK=""
 SERVER_CERT_FILE=""
 SERVER_KEY_FILE=""
 CERT_HOOK_DELETE=""
-CONF_EXISTED_BEFORE_INSTALL=0
 
 # Overridable so tests can point platform detection at a fixture file.
 OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
@@ -90,6 +89,10 @@ valid_hostname() {
   [[ -n "$hostname" && ${#hostname} -le 253 && "$hostname" == *.* ]] ||
     return 1
   IFS='.' read -r -a labels <<<"$hostname"
+  # The final label (TLD) must not be all-numeric; otherwise an IPv4-like
+  # string with an out-of-range octet (e.g. 10.20.30.999) would masquerade
+  # as a valid DNS name after failing the stricter IPv4 check.
+  [[ "${labels[-1]}" =~ ^[0-9]+$ ]] && return 1
   for label in "${labels[@]}"; do
     [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
     [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] ||
@@ -182,9 +185,17 @@ generate_self_signed_certificate() {
   install -d -m 0700 "$(dirname "$SELF_SIGNED_CERT")"
   # Run all temp-file work in a subshell so the EXIT trap cannot leak to callers.
   (
+    # Disable the inherited ERR trap (set -E) so a generation failure inside
+    # this subshell does not roll back here as well; the failure propagates to
+    # the caller, which performs exactly one rollback. Temp cleanup below is
+    # kept via a separate EXIT trap.
+    trap - ERR
     temp_cert="$(mktemp "$(dirname "$SELF_SIGNED_CERT")/.cert.XXXXXX")"
+    # Arm cleanup right after the first temp exists so a failing second mktemp
+    # cannot leak the first; temp_key stays empty until the second call succeeds.
+    temp_key=""
+    trap 'rm -f -- "$temp_cert" ${temp_key:+"$temp_key"}' EXIT
     temp_key="$(mktemp "$(dirname "$SELF_SIGNED_KEY")/.key.XXXXXX")"
-    trap 'rm -f -- "$temp_cert" "$temp_key"' EXIT
     san_type="DNS"
     valid_ipv4 "$OCSERV_ENDPOINT" && san_type="IP"
     openssl req -x509 -newkey rsa:3072 -nodes -sha256 -days 3650 \
@@ -373,14 +384,21 @@ cmd_check() {
 
 cmd_up() {
   ensure_table_ownership "$TABLE_NAME"
-  local interface
+  local interface check_table
   interface="$(get_egress_interface)"
+  RULE_FILE="$(mktemp)"
+  trap 'rm -f -- "$RULE_FILE"' EXIT
+  # Validate that the rendered ruleset would load BEFORE deleting the owned
+  # active table, so a bad ruleset can never tear down the live table with
+  # nothing to replace it. A disposable check-table name avoids a base-chain
+  # collision with the still-present live table (same technique as cmd_check).
+  check_table="${TABLE_NAME}_check_${BASHPID}"
+  render_ruleset "$check_table" "$interface" >"$RULE_FILE"
+  nft --check -f "$RULE_FILE"
+  render_ruleset "$TABLE_NAME" "$interface" >"$RULE_FILE"
   if table_exists "$TABLE_NAME"; then
     nft delete table "$TABLE_FAMILY" "$TABLE_NAME"
   fi
-  RULE_FILE="$(mktemp)"
-  trap 'rm -f -- "$RULE_FILE"' EXIT
-  render_ruleset "$TABLE_NAME" "$interface" >"$RULE_FILE"
   sysctl -w net.ipv4.ip_forward=1
   nft -f "$RULE_FILE"
 }
@@ -441,15 +459,12 @@ is_managed_file() {
 
 check_existing_config() {
   if [[ -e "$OCSERV_CONF" ]]; then
-    CONF_EXISTED_BEFORE_INSTALL=1
     if ! is_managed_file "$OCSERV_CONF"; then
       local backup
       backup="${OCSERV_CONF}.pre-vpn-node-$(date -u +%Y%m%dT%H%M%SZ).bak"
       cp -a -- "$OCSERV_CONF" "$backup"
       die "existing unmanaged ocserv config backed up to $backup; refusing to overwrite"
     fi
-  else
-    CONF_EXISTED_BEFORE_INSTALL=0
   fi
 }
 
@@ -531,6 +546,9 @@ check_route_overlap() {
   local line dest route_start route_end
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
+    # Skip ECMP multipath continuation lines (indented "nexthop ..."), which
+    # are not route destinations; unrelated malformed destinations still fail.
+    [[ "$line" =~ ^[[:space:]]*nexthop[[:space:]] ]] && continue
     dest="${line%% *}"
     [[ "$dest" == "default" ]] && continue
     read -r route_start route_end < <(cidr_bounds "$dest")
@@ -822,14 +840,18 @@ validate_staged_files() {
 }
 
 # Atomically installs one file: stage a same-filesystem temporary target
-# with the final mode, then rename it over the destination.
+# with the final mode, then rename it over the destination. If either the
+# install or the rename fails, the same-directory temp is removed before the
+# failure propagates (and triggers rollback), so no stray temp is left behind.
 _atomic_install_file() {
   local mode="$1" src="$2" dest="$3" dir tmp
   dir="$(dirname "$dest")"
   [[ -d "$dir" ]] || install -d -m 0755 "$dir"
   tmp="$(mktemp "${dir}/.ocserv-deploy.XXXXXX")"
-  install -m "$mode" "$src" "$tmp"
-  mv -f -- "$tmp" "$dest"
+  if ! install -m "$mode" "$src" "$tmp" || ! mv -f -- "$tmp" "$dest"; then
+    rm -f -- "$tmp"
+    die "failed to atomically install $dest"
+  fi
 }
 
 # Promotes the staged files to their live locations with fixed modes. Only
@@ -927,7 +949,11 @@ main() {
       ;;
     install)
       require_root
-      install -d -m 0755 "$(dirname "$INSTALL_LOCK")"
+      # Plain "mkdir -p" (no -m) so an already-existing directory is left
+      # untouched: the real /run/lock is a pre-existing tmpfs directory with
+      # the sticky 1777 mode, and "install -d -m 0755" would strip that to
+      # 0755. Under a test root the parent may not exist yet and is created.
+      mkdir -p -- "$(dirname "$INSTALL_LOCK")"
       exec 9>"$INSTALL_LOCK"
       flock -n 9 || die "another installation is running"
       load_config

@@ -332,7 +332,7 @@ sudo ./ocserv-deploy.sh help
 - 客户端配置固定 `route = default`，即全隧道（所有客户端流量经由 VPN 出口）。
 - 脚本渲染并应用专用 nftables 表 `vpn_node_ocserv`（`ip` 协议族），包含：
   - `_managed_by_vpn_node_maintenance`：空的哨兵链，仅用于标识该表由本工具管理。
-  - `forward` 链（`hook forward`，`policy accept`）：仅放行 VPN 网段与检测到的出口网卡之间的双向流量。
+  - `forward` 链（`hook forward`，`policy accept`）：仅放行 VPN 网段经出口网卡向外**发起**的流量（`ip saddr <VPN 网段> oifname <出口网卡> accept`）；反向仅放行**已建立/相关**（`ct state established,related`）的回程流量（`ip daddr <VPN 网段> iifname <出口网卡> ct state established,related accept`），即由出口网卡侧**新发起**的连接不会被转发进 VPN 网段。
   - `postrouting` 链（`hook postrouting`，`policy accept`）：对经出口网卡离开的 VPN 网段流量做 `masquerade`。
 - 出口网卡通过 `ip -4 route get 1.1.1.1` 在每次 `ocserv-network up`/`down`/`check` 时动态探测，始终跟随当前默认路由。
 - **脚本不安装任何 `INPUT` 链或过滤策略**——不会新增、也不会收紧本机现有的入站防火墙规则；对 `OCSERV_PORT` 的入站放行完全依赖操作系统/云平台已有的防火墙或安全组配置。
@@ -352,14 +352,15 @@ sudo ./ocserv-deploy.sh help
 ```bash
 systemctl status ocserv.service
 journalctl -u ocserv.service -e
-sudo ss -lntup | grep "$OCSERV_PORT"
+sudo ss -H -ltnp "sport = :$OCSERV_PORT"
+sudo ss -H -lunp "sport = :$OCSERV_PORT"
 sudo nft list table ip vpn_node_ocserv
 sudo occtl show status
 sudo occtl show users
 ```
 
 - `systemctl status` / `journalctl`：查看服务是否激活、启动失败原因。
-- `ss -lntup`：确认 TCP 和 UDP 均在 `OCSERV_PORT` 上监听。
+- `ss -H -ltnp "sport = :$OCSERV_PORT"` / `ss -H -lunp "sport = :$OCSERV_PORT"`：用精确的 `sport` 过滤器分别确认 TCP 和 UDP 均在 `OCSERV_PORT` 上监听（避免用 `grep` 端口号误匹配到位数相同、包含相同数字的其它端口）。
 - `nft list table ip vpn_node_ocserv`：确认哨兵链、`forward`、`postrouting`（含 `masquerade`）规则均存在。
 - `occtl`：查看当前连接的用户、流量与会话状态（需要 `use-occtl = true`，脚本已默认开启）。
 
