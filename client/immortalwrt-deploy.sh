@@ -900,6 +900,13 @@ render_uhttpd_batch() {
     _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.cert" "$crt"
     _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.key" "$key"
     _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.cgi_prefix" "/cgi-bin"
+    # LuCI is a client-side app that drives the box over ubus-rpc; without an
+    # ubus_prefix the instance serves static files but every ubus-rpc endpoint
+    # 404s. max_requests/max_connections mirror the factory 'main' instance so
+    # the parallel ubus-rpc requests a LuCI page fires are not starved.
+    _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.ubus_prefix" "/ubus"
+    _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.max_requests" "3"
+    _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.max_connections" "100"
     _addlist "uhttpd.${LUCI_UHTTPD_INSTANCE}.index_page" "index.html"
     _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.script_timeout" "60"
     _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.network_timeout" "30"
@@ -1161,8 +1168,10 @@ ensure_packages() {
   pm="$(detect_pkg_manager)" ||
     die "no supported package manager (opkg/apk) found"
   local -a pkgs=(wireguard-tools kmod-wireguard luci-proto-wireguard)
-  # HomeProxy client + sing-box engine, and the DDNS framework.
-  pkgs+=(homeproxy sing-box ddns-scripts)
+  # HomeProxy client (the LuCI app package, which pulls the engine) + sing-box.
+  # The Cloudflare AAAA updater is a self-contained script, so ddns-scripts is
+  # intentionally not installed.
+  pkgs+=(luci-app-homeproxy sing-box)
   # TLS / certificate tooling depends on the public-LuCI cert mode.
   if [[ "$LUCI_CERT_MODE" == "letsencrypt" ]]; then
     pkgs+=(acme acme-dnsapi luci-app-acme)

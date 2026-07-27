@@ -923,8 +923,10 @@ test_no_connectivity_wait_or_rollback() {
   local rc=0
   ( install_client ) </dev/null >/dev/null 2>&1 || rc=$?
   ((rc == 0)) || fail "install must not depend on WAN connectivity"
-  # Static guarantee: no polling/carrier/ping/ubus status wait exists.
-  ! grep -Eq '\bping\b|operstate|carrier|ubus' "$SCRIPT_PATH" ||
+  # Static guarantee: no polling/carrier/ping/ubus status wait exists. The ubus
+  # match targets an invoked `ubus` command (followed by whitespace), so the
+  # public-LuCI uhttpd `ubus_prefix`/`/ubus` config tokens are not false hits.
+  ! grep -Eq '\bping\b|operstate|carrier|\bubus[[:space:]]' "$SCRIPT_PATH" ||
     fail "script must not wait on connectivity"
 }
 
@@ -981,6 +983,21 @@ test_ensure_packages_adds_pppoe_when_configured() {
   ensure_packages >/dev/null 2>&1
   grep -q 'ppp-mod-pppoe' "$TEST_ROOT/opkg-args.log" ||
     fail "pppoe packages must be installed when PPPoE is configured"
+}
+
+test_ensure_packages_uses_luci_app_homeproxy() {
+  _prep "$PROXY_CONFIG"
+  trap remove_fixture EXIT
+  ensure_packages >/dev/null 2>&1
+  local log="$TEST_ROOT/opkg-args.log"
+  # Must install the LuCI app package, not the bare 'homeproxy' name.
+  grep -qE '(^| )luci-app-homeproxy( |$)' "$log" ||
+    fail "must install luci-app-homeproxy"
+  ! grep -qE '(^| )homeproxy( |$)' "$log" ||
+    fail "must not install the bare 'homeproxy' package name"
+  # The Cloudflare updater is self-contained, so ddns-scripts must not be pulled.
+  ! grep -qE '(^| )ddns-scripts( |$)' "$log" ||
+    fail "unused ddns-scripts must not be installed"
 }
 
 # ==================== HomeProxy config / nodes ====================
@@ -1321,6 +1338,20 @@ test_uhttpd_letsencrypt_cert_path() {
   _grep "/etc/acme/home.example.com/home.example.com.key" "$out"
 }
 
+test_uhttpd_ubus_prefix_for_luci() {
+  _prep "$VALID_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/uh.uci"
+  : >"$out"
+  render_uhttpd_batch "$out"
+  # ubus_prefix is what makes LuCI's ubus-rpc calls resolve on this instance;
+  # max_requests/max_connections mirror the factory 'main' uhttpd instance.
+  _grep "set uhttpd.vpnpublic.ubus_prefix='/ubus'" "$out"
+  _grep "set uhttpd.vpnpublic.max_requests='3'" "$out"
+  _grep "set uhttpd.vpnpublic.max_connections='100'" "$out"
+  _grep "set uhttpd.vpnpublic.cgi_prefix='/cgi-bin'" "$out"
+}
+
 test_acme_letsencrypt_dns_cf() {
   _prep "$LE_CONFIG"
   trap remove_fixture EXIT
@@ -1373,6 +1404,25 @@ test_ddns_updater_stable_gua_dns_only() {
   _grep "scope global" "$f"
   _grep "temporary" "$f"
   _grep "deprecated" "$f"
+}
+
+test_ddns_updater_uses_bearer_api_token() {
+  _prep "$DDNS_CONFIG"
+  trap remove_fixture EXIT
+  local f="$TEST_ROOT/ddns.sh"
+  render_ddns_updater "$f"
+  # The Cloudflare auth header must reference the API_TOKEN variable (Bearer
+  # scheme), and the token must be defined exactly once via API_TOKEN=.
+  _grep 'auth="Authorization: Bearer ${API_TOKEN}"' "$f"
+  _grep 'API_TOKEN=' "$f"
+  # curl must send the header through the $auth variable, never a literal token.
+  _grep 'curl -fsS -H "$auth"' "$f"
+  # The secret value must never be inlined on the Authorization header line.
+  local auth_line
+  auth_line="$(grep -F 'Authorization:' "$f" || true)"
+  case "$auth_line" in
+    *token456*) fail "the token must not appear in the Authorization header line" ;;
+  esac
 }
 
 test_ddns_hotplug_triggers_on_wan6() {
@@ -1533,6 +1583,7 @@ run_test "show-wireguard missing state fails" test_show_wireguard_missing_state_
 
 run_test "ensure_packages installs wireguard-tools" test_ensure_packages_installs_wireguard_tools
 run_test "ensure_packages adds pppoe when configured" test_ensure_packages_adds_pppoe_when_configured
+run_test "ensure_packages uses luci-app-homeproxy" test_ensure_packages_uses_luci_app_homeproxy
 
 run_test "rejects bad HY2_CERT_MODE" test_rejects_bad_hy2_cert_mode
 run_test "rejects bad LUCI_CERT_MODE" test_rejects_bad_luci_cert_mode
@@ -1560,12 +1611,14 @@ run_test "homeproxy absent without VPS" test_homeproxy_absent_without_vps
 run_test "firewall LuCI public IPv6-only" test_firewall_luci_public_ipv6_only
 run_test "uhttpd IPv6-only HTTPS" test_uhttpd_ipv6_only_https
 run_test "uhttpd letsencrypt cert path" test_uhttpd_letsencrypt_cert_path
+run_test "uhttpd ubus_prefix for LuCI" test_uhttpd_ubus_prefix_for_luci
 run_test "acme letsencrypt dns_cf" test_acme_letsencrypt_dns_cf
 run_test "acme absent when selfsigned" test_acme_absent_when_selfsigned
 
 run_test "ddns enabled gating" test_ddns_enabled_gating
 run_test "ddns disabled without domain" test_ddns_disabled_without_domain
 run_test "ddns updater stable GUA DNS-only" test_ddns_updater_stable_gua_dns_only
+run_test "ddns updater uses Bearer API_TOKEN" test_ddns_updater_uses_bearer_api_token
 run_test "ddns hotplug triggers on wan6" test_ddns_hotplug_triggers_on_wan6
 run_test "ddns crontab entry" test_ddns_crontab_entry
 

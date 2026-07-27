@@ -28,6 +28,9 @@ readonly INSTALL_LOCK="${ROOT_PREFIX}/run/lock/sing-box-deploy.lock"
 # the real running host, so they use the true absolute paths regardless of any
 # test ROOT_PREFIX (mirrors the ocserv drop-in convention).
 readonly SERVICE_CONFIG_PATH="/etc/sing-box/config.json"
+# The hopping include path baked into the unit's ExecStartPre is likewise the
+# real host path, never a test-prefixed one.
+readonly SERVICE_NFT_INCLUDE_PATH="/etc/sing-box/hy2-hopping.nft"
 
 readonly NFT_FAMILY="ip"
 readonly NFT_TABLE="vpn_node_singbox"
@@ -457,10 +460,11 @@ render_singbox_config() {
 }
 
 render_systemd_unit() {
-  local out="$1" bin
+  local out="$1" bin nft_bin
   bin="$(command -v sing-box || echo /usr/local/bin/sing-box)"
   install -d -m 0755 "$(dirname "$out")"
-  cat >"$out" <<EOF
+  {
+    cat <<EOF
 $MANAGED_MARKER
 [Unit]
 Description=sing-box dual-protocol proxy (vpn-node-maintenance)
@@ -470,13 +474,25 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+EOF
+    # Re-apply the managed Hysteria2 hopping DNAT before sing-box starts so port
+    # hopping survives reboots (nftables state is not persistent). The '+' prefix
+    # runs the command with full privileges, independent of the reduced service
+    # capability set below, so the main process keeps only CAP_NET_BIND_SERVICE.
+    # The line is emitted only when hopping is configured, so an empty HY2_PORTS
+    # never leaves the unit depending on a missing include file.
+    if [[ -n "$HY2_PORTS_RANGE" ]]; then
+      nft_bin="$(command -v nft || echo /usr/sbin/nft)"
+      printf 'ExecStartPre=+%s -f %s\n' "$nft_bin" "$SERVICE_NFT_INCLUDE_PATH"
+    fi
+    cat <<EOF
 ExecStart=${bin} run -c ${SERVICE_CONFIG_PATH}
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -489,12 +505,17 @@ WorkingDirectory=/var/lib/sing-box
 [Install]
 WantedBy=multi-user.target
 EOF
+  } >"$out"
   chmod 0644 "$out"
 }
 
 # Renders the nftables UDP DNAT include used for Hysteria2 port hopping. The
 # sentinel chain marks the table as ours so ownership can be proven before any
 # later delete/apply. Only rendered when HY2_PORTS is configured.
+#
+# The include is idempotent: it ensures the table exists, deletes it, then
+# recreates it in a single atomic transaction. This lets the unit's ExecStartPre
+# safely re-apply it on every (re)start without erroring on an existing table.
 render_nft_include() {
   local out="$1"
   [[ -n "$HY2_PORTS_RANGE" ]] ||
@@ -502,6 +523,8 @@ render_nft_include() {
   install -d -m 0755 "$(dirname "$out")"
   cat >"$out" <<EOF
 $MANAGED_MARKER
+add table $NFT_FAMILY $NFT_TABLE
+delete table $NFT_FAMILY $NFT_TABLE
 table $NFT_FAMILY $NFT_TABLE {
   chain $NFT_SENTINEL {
   }

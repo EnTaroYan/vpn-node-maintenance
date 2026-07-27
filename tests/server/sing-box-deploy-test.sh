@@ -692,6 +692,101 @@ test_hopping_full_install_applies_nft() {
     fail "nft -f must apply the hopping include during install"
 }
 
+test_unit_reapplies_nft_before_start_when_hopping() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config '
+SERVER_IPV4="104.46.217.92"
+HY2_PORT="443"
+HY2_PORTS="20000:50000"
+REALITY_TARGET="www.microsoft.com"
+'
+  _write_mocks
+  export PATH="$TEST_ROOT/bin:$PATH"
+  source_deployer
+  load_config
+  validate_config
+  local out="$TEST_ROOT/sing-box.service"
+  render_systemd_unit "$out"
+  # Hopping must be re-applied at boot via a privileged ('+') ExecStartPre that
+  # loads the real host include, so port hopping survives reboots.
+  grep -qE '^ExecStartPre=\+.* -f /etc/sing-box/hy2-hopping\.nft$' "$out" ||
+    fail "unit must re-apply the hopping include before start"
+  # ExecStartPre must precede ExecStart so the DNAT exists before sing-box binds.
+  local pre start
+  pre="$(grep -n '^ExecStartPre=' "$out" | head -n1 | cut -d: -f1)"
+  start="$(grep -n '^ExecStart=' "$out" | head -n1 | cut -d: -f1)"
+  [[ -n "$pre" && -n "$start" && "$pre" -lt "$start" ]] ||
+    fail "ExecStartPre must run before ExecStart"
+}
+
+test_unit_no_nft_dependency_when_ports_empty() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config "$VALID_CONFIG"
+  _write_mocks
+  export PATH="$TEST_ROOT/bin:$PATH"
+  source_deployer
+  load_config
+  validate_config
+  local out="$TEST_ROOT/sing-box.service"
+  render_systemd_unit "$out"
+  # With no hopping there must be no ExecStartPre and no reference to the include
+  # file, so the unit never depends on a file that is never installed.
+  ! grep -q '^ExecStartPre=' "$out" ||
+    fail "unit must not add an ExecStartPre when HY2_PORTS is empty"
+  ! grep -qF 'hy2-hopping.nft' "$out" ||
+    fail "unit must not reference the hopping include when HY2_PORTS is empty"
+}
+
+test_unit_drops_cap_net_admin() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config "$VALID_CONFIG"
+  _write_mocks
+  export PATH="$TEST_ROOT/bin:$PATH"
+  source_deployer
+  load_config
+  validate_config
+  local out="$TEST_ROOT/sing-box.service"
+  render_systemd_unit "$out"
+  # sing-box is an inbound proxy (no TUN); the privileged ExecStartPre owns the
+  # nftables work, so the service itself keeps only CAP_NET_BIND_SERVICE.
+  grep -qx 'AmbientCapabilities=CAP_NET_BIND_SERVICE' "$out" ||
+    fail "AmbientCapabilities must be exactly CAP_NET_BIND_SERVICE"
+  grep -qx 'CapabilityBoundingSet=CAP_NET_BIND_SERVICE' "$out" ||
+    fail "CapabilityBoundingSet must be exactly CAP_NET_BIND_SERVICE"
+  ! grep -q 'CAP_NET_ADMIN' "$out" ||
+    fail "the service must not grant the unused CAP_NET_ADMIN"
+}
+
+test_nft_include_idempotent_cleanup() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config '
+SERVER_IPV4="104.46.217.92"
+HY2_PORT="443"
+HY2_PORTS="20000:50000"
+REALITY_TARGET="www.microsoft.com"
+'
+  source_deployer
+  load_config
+  validate_config
+  local out="$TEST_ROOT/hop.nft"
+  render_nft_include "$out"
+  # The include ensures then deletes the table before recreating it, so a
+  # repeated ExecStartPre re-apply cleans prior state instead of erroring.
+  grep -qxF "add table ip vpn_node_singbox" "$out" ||
+    fail "include must ensure the table exists before deleting it"
+  grep -qxF "delete table ip vpn_node_singbox" "$out" ||
+    fail "include must delete the table before recreating it"
+  local del recreate
+  del="$(grep -n '^delete table ' "$out" | head -n1 | cut -d: -f1)"
+  recreate="$(grep -n '^table ip vpn_node_singbox {' "$out" | head -n1 | cut -d: -f1)"
+  [[ -n "$del" && -n "$recreate" && "$del" -lt "$recreate" ]] ||
+    fail "the delete must precede the table recreation"
+}
+
 # ==================== Collision refusal ====================
 
 test_refuses_unmanaged_config() {
@@ -975,6 +1070,10 @@ run_test "hopping absent when ports empty" test_hopping_absent_when_ports_empty
 run_test "hopping refuses unowned table" test_hopping_refuses_unowned_table
 run_test "hopping allows owned table" test_hopping_allows_owned_table
 run_test "hopping full install applies nft" test_hopping_full_install_applies_nft
+run_test "unit re-applies nft before start when hopping" test_unit_reapplies_nft_before_start_when_hopping
+run_test "unit has no nft dependency when ports empty" test_unit_no_nft_dependency_when_ports_empty
+run_test "unit drops CAP_NET_ADMIN" test_unit_drops_cap_net_admin
+run_test "nft include idempotent cleanup" test_nft_include_idempotent_cleanup
 
 run_test "refuses unmanaged config" test_refuses_unmanaged_config
 run_test "refuses unmanaged unit" test_refuses_unmanaged_unit
