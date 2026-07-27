@@ -66,6 +66,62 @@ WG_GLOBAL_PEERS=(
 )
 '
 
+# Full proxy parameters (as copied from the server client-params file), with a
+# self-signed HY2 trust anchor (a short fake PEM).
+PROXY_CONFIG='
+LAN_ADDRESS="10.192.0.1/24"
+VPS_IPV4="203.0.113.7"
+HY2_PORT="443"
+HY2_PASSWORD="hy2pass"
+HY2_OBFS_PASSWORD="salampass"
+HY2_CERT_MODE="selfsigned"
+HY2_CERT_PIN="-----BEGIN CERTIFICATE-----
+FAKEHY2CERTIFICATEBODY
+-----END CERTIFICATE-----"
+REALITY_PORT="443"
+REALITY_UUID="11111111-2222-3333-4444-555555555555"
+REALITY_PUBLIC_KEY="REALITYPUBKEY0001"
+REALITY_SHORT_ID="0a1b2c3d"
+REALITY_TARGET_NAME="www.microsoft.com"
+'
+
+# Proxy + optional Cloudflare AAAA DDNS.
+DDNS_CONFIG='
+LAN_ADDRESS="10.192.0.1/24"
+VPS_IPV4="203.0.113.7"
+HY2_PASSWORD="hy2pass"
+HY2_OBFS_PASSWORD="salampass"
+HY2_CERT_MODE="selfsigned"
+HY2_CERT_PIN="-----BEGIN CERTIFICATE-----
+FAKEHY2CERTIFICATEBODY
+-----END CERTIFICATE-----"
+REALITY_UUID="11111111-2222-3333-4444-555555555555"
+REALITY_PUBLIC_KEY="REALITYPUBKEY0001"
+REALITY_SHORT_ID="0a1b2c3d"
+REALITY_TARGET_NAME="www.microsoft.com"
+HOME_DOMAIN="home.example.com"
+CLOUDFLARE_ZONE_ID="zone123"
+CLOUDFLARE_API_TOKEN="token456"
+'
+
+# Proxy + Let'\''s Encrypt for both HY2 (public CA) and public LuCI (DNS-01).
+LE_CONFIG='
+LAN_ADDRESS="10.192.0.1/24"
+VPS_IPV4="203.0.113.7"
+HY2_PASSWORD="hy2pass"
+HY2_OBFS_PASSWORD="salampass"
+HY2_CERT_MODE="letsencrypt"
+HY2_SNI="hy2.example.com"
+REALITY_UUID="11111111-2222-3333-4444-555555555555"
+REALITY_PUBLIC_KEY="REALITYPUBKEY0001"
+REALITY_SHORT_ID="0a1b2c3d"
+REALITY_TARGET_NAME="www.microsoft.com"
+HOME_DOMAIN="home.example.com"
+CLOUDFLARE_ZONE_ID="zone123"
+CLOUDFLARE_API_TOKEN="token456"
+LUCI_CERT_MODE="letsencrypt"
+'
+
 _grep() { grep -qF "$1" "$2" || fail "expected to find: $1"; }
 _grepe() { grep -qE "$1" "$2" || fail "expected to match: $1"; }
 _ngrep() { ! grep -qF "$1" "$2" || fail "unexpected content: $1"; }
@@ -918,6 +974,426 @@ test_ensure_packages_adds_pppoe_when_configured() {
     fail "pppoe packages must be installed when PPPoE is configured"
 }
 
+# ==================== HomeProxy config / nodes ====================
+
+test_rejects_bad_hy2_cert_mode() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config 'HY2_CERT_MODE="bogus"'
+  source_deployer
+  load_config
+  assert_failure validate_config
+}
+
+test_rejects_bad_luci_cert_mode() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config 'LUCI_CERT_MODE="bogus"'
+  source_deployer
+  load_config
+  assert_failure validate_config
+}
+
+test_rejects_bad_luci_port() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config 'LUCI_PUBLIC_PORT="70000"'
+  source_deployer
+  load_config
+  assert_failure validate_config
+}
+
+test_rejects_proxy_without_password() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config 'VPS_IPV4="203.0.113.7"'
+  source_deployer
+  load_config
+  assert_failure validate_config
+}
+
+test_rejects_selfsigned_without_pin() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config '
+VPS_IPV4="203.0.113.7"
+HY2_PASSWORD="p"
+HY2_OBFS_PASSWORD="o"
+REALITY_UUID="11111111-2222-3333-4444-555555555555"
+REALITY_PUBLIC_KEY="k"
+REALITY_SHORT_ID="s"
+REALITY_TARGET_NAME="www.microsoft.com"
+HY2_CERT_MODE="selfsigned"
+'
+  source_deployer
+  load_config
+  assert_failure validate_config
+}
+
+test_accepts_full_proxy_config() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config "$PROXY_CONFIG"
+  source_deployer
+  load_config
+  assert_success validate_config
+}
+
+test_rejects_home_domain_without_token() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config 'HOME_DOMAIN="home.example.com"'
+  source_deployer
+  load_config
+  assert_failure validate_config
+}
+
+test_rejects_le_luci_without_domain() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config 'LUCI_CERT_MODE="letsencrypt"'
+  source_deployer
+  load_config
+  assert_failure validate_config
+}
+
+test_homeproxy_gfwlist_ipv4_only() {
+  _prep "$PROXY_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/hp.uci"
+  : >"$out"
+  render_homeproxy_batch "$out"
+  _grep "set homeproxy.config.proxy_mode='redirect_tproxy'" "$out"
+  _grep "set homeproxy.config.routing_mode='gfwlist'" "$out"
+  _grep "set homeproxy.config.ipv6_support='0'" "$out"
+  _grep "set homeproxy.config.main_node='hp_hy2'" "$out"
+  _grep "set homeproxy.config.main_udp_node='same'" "$out"
+  _grep "set homeproxy.dns.dns_strategy='ipv4_only'" "$out"
+}
+
+test_homeproxy_resource_cron() {
+  _prep "$PROXY_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/hp.uci"
+  : >"$out"
+  render_homeproxy_batch "$out"
+  _grep "set homeproxy.subscription.auto_update='1'" "$out"
+  _grepe "^set homeproxy.subscription.auto_update_time='[0-9]+'$" "$out"
+}
+
+test_homeproxy_wg_global_source_global_proxy() {
+  _prep "$PROXY_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/hp.uci"
+  : >"$out"
+  render_homeproxy_batch "$out"
+  _grep "set homeproxy.control.lan_proxy_mode='disabled'" "$out"
+  _grep "delete homeproxy.control.lan_global_proxy_ipv4_ips" "$out"
+  _grep "add_list homeproxy.control.lan_global_proxy_ipv4_ips='10.192.100.0/24'" "$out"
+  # wg-local subnet is NOT globally proxied (it follows GFWList like the LAN).
+  _ngrep "lan_global_proxy_ipv4_ips='10.192.200.0/24'" "$out"
+  # The delete must precede the add so re-runs stay idempotent.
+  local del_ln add_ln
+  del_ln="$(grep -nF "delete homeproxy.control.lan_global_proxy_ipv4_ips" "$out" | head -1 | cut -d: -f1)"
+  add_ln="$(grep -nF "add_list homeproxy.control.lan_global_proxy_ipv4_ips" "$out" | head -1 | cut -d: -f1)"
+  ((del_ln < add_ln)) || fail "global-proxy list must be cleared before add_list"
+}
+
+test_homeproxy_manual_lists_preserved() {
+  _prep "$PROXY_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/hp.uci"
+  : >"$out"
+  render_homeproxy_batch "$out"
+  # Only our own global-proxy list is cleared; manual proxy/direct lists survive.
+  _ngrep "delete homeproxy.control.wan_proxy_ipv4_ips" "$out"
+  _ngrep "delete homeproxy.control.wan_proxy_ipv6_ips" "$out"
+  _ngrep "delete homeproxy.control.lan_direct_ipv4_ips" "$out"
+  _ngrep "delete homeproxy.control.lan_direct_ipv6_ips" "$out"
+}
+
+test_homeproxy_hy2_node_selfsigned() {
+  _prep "$PROXY_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/hp.uci"
+  : >"$out"
+  render_homeproxy_batch "$out"
+  _grep "set homeproxy.hp_hy2=node" "$out"
+  _grep "set homeproxy.hp_hy2.type='hysteria2'" "$out"
+  _grep "set homeproxy.hp_hy2.address='203.0.113.7'" "$out"
+  _grep "set homeproxy.hp_hy2.port='443'" "$out"
+  _grep "set homeproxy.hp_hy2.password='hy2pass'" "$out"
+  _grep "set homeproxy.hp_hy2.hysteria_obfs_type='salamander'" "$out"
+  _grep "set homeproxy.hp_hy2.hysteria_obfs_password='salampass'" "$out"
+  _grep "set homeproxy.hp_hy2.tls='1'" "$out"
+  _grep "set homeproxy.hp_hy2.tls_sni='203.0.113.7'" "$out"
+  _grep "set homeproxy.hp_hy2.tls_insecure='0'" "$out"
+  _grep "set homeproxy.hp_hy2.tls_self_sign='1'" "$out"
+  _grep "set homeproxy.hp_hy2.tls_cert_path=" "$out"
+  _grep "/etc/homeproxy/certs/hy2_server_ca.pem" "$out"
+  # Never fall back to insecure TLS.
+  _ngrep "set homeproxy.hp_hy2.tls_insecure='1'" "$out"
+}
+
+test_homeproxy_hy2_letsencrypt_no_selfsign() {
+  _prep "$LE_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/hp.uci"
+  : >"$out"
+  render_homeproxy_batch "$out"
+  _grep "set homeproxy.hp_hy2.tls='1'" "$out"
+  _grep "set homeproxy.hp_hy2.tls_insecure='0'" "$out"
+  _grep "set homeproxy.hp_hy2.tls_sni='hy2.example.com'" "$out"
+  _ngrep "set homeproxy.hp_hy2.tls_self_sign='1'" "$out"
+  _ngrep "set homeproxy.hp_hy2.tls_cert_path=" "$out"
+}
+
+test_homeproxy_reality_node() {
+  _prep "$PROXY_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/hp.uci"
+  : >"$out"
+  render_homeproxy_batch "$out"
+  _grep "set homeproxy.hp_reality=node" "$out"
+  _grep "set homeproxy.hp_reality.type='vless'" "$out"
+  _grep "set homeproxy.hp_reality.uuid='11111111-2222-3333-4444-555555555555'" "$out"
+  _grep "set homeproxy.hp_reality.vless_flow='xtls-rprx-vision'" "$out"
+  _grep "set homeproxy.hp_reality.tls='1'" "$out"
+  _grep "set homeproxy.hp_reality.tls_sni='www.microsoft.com'" "$out"
+  _grep "set homeproxy.hp_reality.tls_reality='1'" "$out"
+  _grep "set homeproxy.hp_reality.tls_reality_public_key='REALITYPUBKEY0001'" "$out"
+  _grep "set homeproxy.hp_reality.tls_reality_short_id='0a1b2c3d'" "$out"
+  _grep "set homeproxy.hp_reality.tls_utls='chrome'" "$out"
+  _grep "set homeproxy.hp_reality.tls_insecure='0'" "$out"
+}
+
+test_homeproxy_main_node_switchable() {
+  _prep "$PROXY_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/hp.uci"
+  : >"$out"
+  render_homeproxy_batch "$out"
+  # Both nodes exist so the user can switch main_node in LuCI; HY2 is default.
+  _grep "set homeproxy.hp_hy2=node" "$out"
+  _grep "set homeproxy.hp_reality=node" "$out"
+  _grep "set homeproxy.config.main_node='hp_hy2'" "$out"
+}
+
+test_homeproxy_hopping_ports() {
+  _prep '
+LAN_ADDRESS="10.192.0.1/24"
+VPS_IPV4="203.0.113.7"
+HY2_PORT="443"
+HY2_PORTS="20000:30000"
+HY2_PASSWORD="hy2pass"
+HY2_OBFS_PASSWORD="salampass"
+HY2_CERT_MODE="selfsigned"
+HY2_CERT_PIN="-----BEGIN CERTIFICATE-----
+X
+-----END CERTIFICATE-----"
+REALITY_UUID="11111111-2222-3333-4444-555555555555"
+REALITY_PUBLIC_KEY="k"
+REALITY_SHORT_ID="s"
+REALITY_TARGET_NAME="www.microsoft.com"
+'
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/hp.uci"
+  : >"$out"
+  render_homeproxy_batch "$out"
+  _grep "add_list homeproxy.hp_hy2.hysteria_hopping_port='20000:30000'" "$out"
+}
+
+test_homeproxy_absent_without_vps() {
+  _prep "$VALID_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/hp.uci"
+  : >"$out"
+  render_homeproxy_batch "$out"
+  _ngrep "homeproxy.config" "$out"
+  _ngrep "=node" "$out"
+}
+
+# ==================== Firewall / uhttpd / acme ====================
+
+test_firewall_luci_public_ipv6_only() {
+  _prep "$VALID_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/fw.uci"
+  render_firewall_batch "$out"
+  _grep "set firewall.luci_public_in.src='wan'" "$out"
+  _grep "set firewall.luci_public_in.proto='tcp'" "$out"
+  _grep "set firewall.luci_public_in.dest_port='10443'" "$out"
+  _grep "set firewall.luci_public_in.family='ipv6'" "$out"
+  _grep "set firewall.luci_public_in.target='ACCEPT'" "$out"
+}
+
+test_uhttpd_ipv6_only_https() {
+  _prep "$VALID_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/uh.uci"
+  : >"$out"
+  render_uhttpd_batch "$out"
+  _grep "set uhttpd.vpnpublic=uhttpd" "$out"
+  _grep "add_list uhttpd.vpnpublic.listen_https='[::]:10443'" "$out"
+  _grep "set uhttpd.vpnpublic.redirect_https='0'" "$out"
+  _grep "delete uhttpd.vpnpublic.listen_http" "$out"
+  _grep "luci-public.crt" "$out"
+  _grep "luci-public.key" "$out"
+  # No plain-HTTP listener and no IPv4 bind.
+  _ngrep "uhttpd.vpnpublic.listen_http='" "$out"
+  _ngrep "0.0.0.0:" "$out"
+}
+
+test_uhttpd_letsencrypt_cert_path() {
+  _prep "$LE_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/uh.uci"
+  : >"$out"
+  render_uhttpd_batch "$out"
+  _grep "/etc/acme/home.example.com/fullchain.cer" "$out"
+  _grep "/etc/acme/home.example.com/home.example.com.key" "$out"
+}
+
+test_acme_letsencrypt_dns_cf() {
+  _prep "$LE_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/acme.uci"
+  : >"$out"
+  render_acme_batch "$out"
+  _grep "set acme.luci_public=cert" "$out"
+  _grep "set acme.luci_public.validation_method='dns'" "$out"
+  _grep "set acme.luci_public.dns='dns_cf'" "$out"
+  _grep "add_list acme.luci_public.domains='home.example.com'" "$out"
+  _grep "add_list acme.luci_public.credentials='CF_Token=token456'" "$out"
+  _grep "add_list acme.luci_public.credentials='CF_Zone_ID=zone123'" "$out"
+}
+
+test_acme_absent_when_selfsigned() {
+  _prep "$PROXY_CONFIG"
+  trap remove_fixture EXIT
+  local out="$TEST_ROOT/acme.uci"
+  : >"$out"
+  render_acme_batch "$out"
+  _ngrep "acme.luci_public" "$out"
+}
+
+# ==================== Cloudflare AAAA DDNS ====================
+
+test_ddns_enabled_gating() {
+  _prep "$DDNS_CONFIG"
+  trap remove_fixture EXIT
+  assert_success ddns_enabled
+}
+
+test_ddns_disabled_without_domain() {
+  _prep "$PROXY_CONFIG"
+  trap remove_fixture EXIT
+  assert_failure ddns_enabled
+}
+
+test_ddns_updater_stable_gua_dns_only() {
+  _prep "$DDNS_CONFIG"
+  trap remove_fixture EXIT
+  local f="$TEST_ROOT/ddns.sh"
+  render_ddns_updater "$f"
+  assert_eq "700" "$(stat -c '%a' "$f")" "updater mode 0700"
+  _grep "api.cloudflare.com" "$f"
+  _grep '"proxied":false' "$f"
+  _grep "home.example.com" "$f"
+  _grep "token456" "$f"
+  _grep "zone123" "$f"
+  # Stable-GUA selection skips temporary/deprecated addresses.
+  _grep "scope global" "$f"
+  _grep "temporary" "$f"
+  _grep "deprecated" "$f"
+}
+
+test_ddns_hotplug_triggers_on_wan6() {
+  _prep "$DDNS_CONFIG"
+  trap remove_fixture EXIT
+  local f="$TEST_ROOT/hotplug"
+  render_ddns_hotplug "$f"
+  assert_eq "755" "$(stat -c '%a' "$f")" "hotplug mode 0755"
+  _grep 'ifup' "$f"
+  _grep 'wan6' "$f"
+  _grep 'wanpppoe6' "$f"
+  _grep "cloudflare-aaaa.sh" "$f"
+}
+
+test_ddns_crontab_entry() {
+  _prep "$DDNS_CONFIG"
+  trap remove_fixture EXIT
+  local f="$TEST_ROOT/cron"
+  render_ddns_crontab "$f"
+  _grep "cloudflare-aaaa.sh" "$f"
+  _grep "#vpn-node-ddns" "$f"
+  _grepe "^\*/[0-9]+ " "$f"
+}
+
+# ==================== Full install (Task-4 artifacts) ====================
+
+test_install_writes_proxy_luci_ddns_artifacts() {
+  _prep "$DDNS_CONFIG"
+  trap remove_fixture EXIT
+  local rc=0
+  ( install_client ) </dev/null >/dev/null 2>&1 || rc=$?
+  ((rc == 0)) || fail "install_client must succeed for a full proxy+ddns config"
+  grep -q "homeproxy.config.routing_mode='gfwlist'" "$TEST_ROOT/uci-cmd.log" ||
+    fail "homeproxy config must be applied"
+  grep -q "uhttpd.vpnpublic" "$TEST_ROOT/uci-cmd.log" ||
+    fail "public uhttpd instance must be applied"
+  [[ -f "$HY2_CA_FILE" ]] || fail "HY2 self-signed trust anchor not installed"
+  [[ -f "$LUCI_PUBLIC_CRT" && -f "$LUCI_PUBLIC_KEY_FILE" ]] ||
+    fail "public LuCI self-signed cert/key not installed"
+  [[ -f "$DDNS_UPDATER" ]] || fail "DDNS updater not installed"
+  assert_eq "700" "$(stat -c '%a' "$DDNS_UPDATER")" "updater mode"
+  [[ -f "$DDNS_HOTPLUG" ]] || fail "DDNS hotplug hook not installed"
+  grep -q "#vpn-node-ddns" "$CRONTAB_ROOT" || fail "DDNS cron entry not installed"
+  grep -q '^ARGS: uhttpd reload' "$TEST_ROOT/service-args.log" ||
+    fail "public uhttpd must be reloaded"
+  grep -q '^ARGS: homeproxy restart' "$TEST_ROOT/service-args.log" ||
+    fail "homeproxy must be restarted"
+  grep -q '^ARGS: cron restart' "$TEST_ROOT/service-args.log" ||
+    fail "cron must be restarted for the DDNS job"
+}
+
+test_install_selfsigned_luci_has_no_acme() {
+  _prep "$PROXY_CONFIG"
+  trap remove_fixture EXIT
+  local rc=0
+  ( install_client ) </dev/null >/dev/null 2>&1 || rc=$?
+  ((rc == 0)) || fail "install_client must succeed"
+  [[ -f "$LUCI_PUBLIC_CRT" ]] || fail "self-signed LuCI cert must be generated"
+  ! grep -q "acme.luci_public" "$TEST_ROOT/uci-cmd.log" ||
+    fail "no acme config in self-signed mode"
+  # DDNS not configured here.
+  [[ ! -e "$DDNS_UPDATER" ]] || fail "no DDNS updater without a home domain"
+}
+
+test_rollback_removes_task4_artifacts() {
+  _prep "$DDNS_CONFIG"
+  trap remove_fixture EXIT
+  install -d -m 0755 "$UCI_CONFIG_DIR"
+  printf '# PRIOR-NETWORK\n' >"$NETWORK_CONFIG"
+  # Commit succeeds; a service reload fails, so rollback must remove every new
+  # Task-4 artifact and restore the prior config.
+  touch "$TEST_ROOT/ctl/service_fail"
+  local rc=0
+  ( install_client ) </dev/null >/dev/null 2>&1 || rc=$?
+  ((rc != 0)) || fail "install must fail when a service reload fails"
+  _grep "# PRIOR-NETWORK" "$NETWORK_CONFIG"
+  [[ ! -e "$HY2_CA_FILE" ]] || fail "HY2 trust anchor must be rolled back"
+  [[ ! -e "$LUCI_PUBLIC_CRT" ]] || fail "LuCI cert must be rolled back"
+  [[ ! -e "$DDNS_UPDATER" ]] || fail "DDNS updater must be rolled back"
+  [[ ! -e "$DDNS_HOTPLUG" ]] || fail "DDNS hotplug must be rolled back"
+}
+
+test_no_login_lockout_mechanism() {
+  # The design explicitly forbids a login-attempt lockout for public LuCI.
+  ! grep -qi 'fail2ban' "$SCRIPT_PATH" || fail "must not implement fail2ban"
+  ! grep -qi 'lockout' "$SCRIPT_PATH" || fail "must not implement a login lockout"
+}
+
 # ==================== Runner ====================
 
 run_test "valid config passes" test_valid_config_passes
@@ -990,5 +1466,42 @@ run_test "show-wireguard missing state fails" test_show_wireguard_missing_state_
 
 run_test "ensure_packages installs wireguard-tools" test_ensure_packages_installs_wireguard_tools
 run_test "ensure_packages adds pppoe when configured" test_ensure_packages_adds_pppoe_when_configured
+
+run_test "rejects bad HY2_CERT_MODE" test_rejects_bad_hy2_cert_mode
+run_test "rejects bad LUCI_CERT_MODE" test_rejects_bad_luci_cert_mode
+run_test "rejects bad LUCI_PUBLIC_PORT" test_rejects_bad_luci_port
+run_test "rejects proxy without password" test_rejects_proxy_without_password
+run_test "rejects selfsigned without pin" test_rejects_selfsigned_without_pin
+run_test "accepts full proxy config" test_accepts_full_proxy_config
+run_test "rejects home domain without token" test_rejects_home_domain_without_token
+run_test "rejects LE LuCI without domain" test_rejects_le_luci_without_domain
+
+run_test "homeproxy gfwlist IPv4-only" test_homeproxy_gfwlist_ipv4_only
+run_test "homeproxy resource cron" test_homeproxy_resource_cron
+run_test "homeproxy wg-global source global proxy" test_homeproxy_wg_global_source_global_proxy
+run_test "homeproxy manual lists preserved" test_homeproxy_manual_lists_preserved
+run_test "homeproxy HY2 node selfsigned" test_homeproxy_hy2_node_selfsigned
+run_test "homeproxy HY2 letsencrypt no selfsign" test_homeproxy_hy2_letsencrypt_no_selfsign
+run_test "homeproxy REALITY node" test_homeproxy_reality_node
+run_test "homeproxy main node switchable" test_homeproxy_main_node_switchable
+run_test "homeproxy hopping ports" test_homeproxy_hopping_ports
+run_test "homeproxy absent without VPS" test_homeproxy_absent_without_vps
+
+run_test "firewall LuCI public IPv6-only" test_firewall_luci_public_ipv6_only
+run_test "uhttpd IPv6-only HTTPS" test_uhttpd_ipv6_only_https
+run_test "uhttpd letsencrypt cert path" test_uhttpd_letsencrypt_cert_path
+run_test "acme letsencrypt dns_cf" test_acme_letsencrypt_dns_cf
+run_test "acme absent when selfsigned" test_acme_absent_when_selfsigned
+
+run_test "ddns enabled gating" test_ddns_enabled_gating
+run_test "ddns disabled without domain" test_ddns_disabled_without_domain
+run_test "ddns updater stable GUA DNS-only" test_ddns_updater_stable_gua_dns_only
+run_test "ddns hotplug triggers on wan6" test_ddns_hotplug_triggers_on_wan6
+run_test "ddns crontab entry" test_ddns_crontab_entry
+
+run_test "install writes proxy/LuCI/DDNS artifacts" test_install_writes_proxy_luci_ddns_artifacts
+run_test "install selfsigned LuCI has no acme" test_install_selfsigned_luci_has_no_acme
+run_test "rollback removes Task-4 artifacts" test_rollback_removes_task4_artifacts
+run_test "no login lockout mechanism" test_no_login_lockout_mechanism
 
 finish_tests

@@ -18,10 +18,29 @@ readonly UCI_CONFIG_DIR="${ROOT_PREFIX}/etc/config"
 readonly NETWORK_CONFIG="${UCI_CONFIG_DIR}/network"
 readonly FIREWALL_CONFIG="${UCI_CONFIG_DIR}/firewall"
 readonly DHCP_CONFIG="${UCI_CONFIG_DIR}/dhcp"
-readonly WG_STATE_FILE="${ROOT_PREFIX}/etc/vpn-node/immortalwrt-wg-state.env"
-readonly CLIENT_TEMPLATE_DIR="${ROOT_PREFIX}/etc/vpn-node/wg-clients"
+readonly HOMEPROXY_CONFIG="${UCI_CONFIG_DIR}/homeproxy"
+readonly UHTTPD_CONFIG="${UCI_CONFIG_DIR}/uhttpd"
+readonly ACME_CONFIG="${UCI_CONFIG_DIR}/acme"
+readonly VPN_NODE_DIR="${ROOT_PREFIX}/etc/vpn-node"
+readonly WG_STATE_FILE="${VPN_NODE_DIR}/immortalwrt-wg-state.env"
+readonly CLIENT_TEMPLATE_DIR="${VPN_NODE_DIR}/wg-clients"
 readonly INSTALL_LOCK="${ROOT_PREFIX}/run/lock/immortalwrt-deploy.lock"
 readonly TRANSACTION_DIR_ROOT="${ROOT_PREFIX}/run/immortalwrt-deploy"
+
+# HomeProxy self-signed trust anchor for the Hysteria2 node (PEM). Lives under
+# /etc/homeproxy/certs so it is inside the ujail mount sing-box runs under.
+readonly HOMEPROXY_CERT_DIR="${ROOT_PREFIX}/etc/homeproxy/certs"
+readonly HY2_CA_FILE="${HOMEPROXY_CERT_DIR}/hy2_server_ca.pem"
+
+# Public LuCI (separate uhttpd instance) self-signed certificate material.
+readonly LUCI_PUBLIC_CRT="${VPN_NODE_DIR}/luci-public.crt"
+readonly LUCI_PUBLIC_KEY_FILE="${VPN_NODE_DIR}/luci-public.key"
+
+# Optional Cloudflare AAAA DDNS updater, iface hotplug hook, and root crontab.
+readonly DDNS_UPDATER="${VPN_NODE_DIR}/cloudflare-aaaa.sh"
+readonly DDNS_HOTPLUG="${ROOT_PREFIX}/etc/hotplug.d/iface/99-vpn-node-ddns"
+readonly CRONTAB_ROOT="${ROOT_PREFIX}/etc/crontabs/root"
+readonly DDNS_CRON_TAG="#vpn-node-ddns"
 
 # Logical interface / section names (never the physical device names).
 readonly WAN_IFACE="wan"
@@ -30,6 +49,12 @@ readonly PPPOE_IFACE="wanpppoe"
 readonly PPPOE6_IFACE="wanpppoe6"
 readonly WG_GLOBAL_IFACE="wg_global"
 readonly WG_LOCAL_IFACE="wg_local"
+
+# HomeProxy node / uhttpd / acme section names.
+readonly HP_HY2_NODE="hp_hy2"
+readonly HP_REALITY_NODE="hp_reality"
+readonly LUCI_UHTTPD_INSTANCE="vpnpublic"
+readonly LUCI_ACME_CERT="luci_public"
 
 # Interactive device selection results.
 WAN_DEVICE=""
@@ -40,6 +65,12 @@ TXN_DIR=""
 STAGED_BATCH=""
 STAGED_STATE=""
 STAGED_CLIENTS=""
+STAGED_HY2_CA=""
+STAGED_LUCI_CRT=""
+STAGED_LUCI_KEY=""
+STAGED_DDNS_SCRIPT=""
+STAGED_DDNS_HOTPLUG=""
+STAGED_DDNS_CRON=""
 TRANSACTION_ACTIVE=0
 ROLLBACK_RUNNING=0
 declare -ga SNAPSHOT_TARGETS=()
@@ -128,6 +159,41 @@ apply_defaults() {
   WG_GLOBAL_PUBLIC_KEY="${WG_GLOBAL_PUBLIC_KEY:-}"
   WG_LOCAL_PRIVATE_KEY="${WG_LOCAL_PRIVATE_KEY:-}"
   WG_LOCAL_PUBLIC_KEY="${WG_LOCAL_PUBLIC_KEY:-}"
+
+  # ---- sing-box proxy nodes (copied from the server client-params file) ----
+  VPS_IPV4="${VPS_IPV4:-}"
+  HY2_PORT="${HY2_PORT:-443}"
+  HY2_PORTS="${HY2_PORTS:-}"
+  HY2_PASSWORD="${HY2_PASSWORD:-}"
+  HY2_OBFS_PASSWORD="${HY2_OBFS_PASSWORD:-}"
+  HY2_SNI="${HY2_SNI:-}"
+  HY2_CERT_MODE="${HY2_CERT_MODE:-selfsigned}"
+  HY2_CERT_PIN="${HY2_CERT_PIN:-}"
+  REALITY_PORT="${REALITY_PORT:-443}"
+  REALITY_UUID="${REALITY_UUID:-}"
+  REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"
+  REALITY_SHORT_ID="${REALITY_SHORT_ID:-}"
+  REALITY_TARGET_NAME="${REALITY_TARGET_NAME:-}"
+  REALITY_FINGERPRINT="${REALITY_FINGERPRINT:-chrome}"
+
+  # ---- Optional home IPv6 Cloudflare DDNS ----
+  HOME_DOMAIN="${HOME_DOMAIN:-}"
+  CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-}"
+  CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
+
+  # ---- Public LuCI (separate IPv6-only HTTPS instance) ----
+  LUCI_PUBLIC_PORT="${LUCI_PUBLIC_PORT:-10443}"
+  LUCI_CERT_MODE="${LUCI_CERT_MODE:-selfsigned}"
+}
+
+# Proxy (HomeProxy node) configuration is emitted only when a server has been
+# provisioned and its IPv4 literal copied in.
+proxy_enabled() { [[ -n "$VPS_IPV4" ]]; }
+
+# The optional Cloudflare AAAA DDNS is active only with a domain and full
+# Cloudflare credentials; an absent domain or token means no DDNS.
+ddns_enabled() {
+  [[ -n "$HOME_DOMAIN" && -n "$CLOUDFLARE_API_TOKEN" && -n "$CLOUDFLARE_ZONE_ID" ]]
 }
 
 valid_ipv4() {
@@ -156,6 +222,37 @@ valid_port() {
 
 valid_uint() {
   [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+valid_hostname() {
+  local h="$1"
+  ((${#h} <= 253)) || return 1
+  [[ "$h" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]]
+}
+
+# "START:END" UDP port-hopping range with START <= END.
+valid_port_range() {
+  local v="$1" a b
+  [[ "$v" == *:* ]] || return 1
+  a="${v%%:*}"
+  b="${v##*:}"
+  valid_port "$a" && valid_port "$b" && ((10#$a <= 10#$b))
+}
+
+# Network address (host bits cleared) for an IPv4 CIDR, e.g.
+# 10.192.100.1/24 -> 10.192.100.0/24.
+ipv4_network_cidr() {
+  local cidr="$1" ip prefix mask
+  local -a ipo masko
+  ip="${cidr%/*}"
+  prefix="${cidr#*/}"
+  mask="$(prefix_to_netmask "$prefix")"
+  IFS='.' read -r -a ipo <<<"$ip"
+  IFS='.' read -r -a masko <<<"$mask"
+  printf '%d.%d.%d.%d/%s' \
+    "$((10#${ipo[0]} & 10#${masko[0]}))" "$((10#${ipo[1]} & 10#${masko[1]}))" \
+    "$((10#${ipo[2]} & 10#${masko[2]}))" "$((10#${ipo[3]} & 10#${masko[3]}))" \
+    "$prefix"
 }
 
 prefix_to_netmask() {
@@ -208,6 +305,71 @@ validate_config() {
 
   validate_peer_entries "$WG_GLOBAL_IFACE" WG_GLOBAL_PEERS
   validate_peer_entries "$WG_LOCAL_IFACE" WG_LOCAL_PEERS
+
+  validate_proxy_config
+  validate_ddns_config
+  validate_luci_config
+}
+
+# HomeProxy node parameters. The proxy is configured only when VPS_IPV4 is set
+# (copied from the server client-params file); the remaining node fields are
+# then required so the HY2 and REALITY nodes are complete.
+validate_proxy_config() {
+  case "$HY2_CERT_MODE" in
+    selfsigned | letsencrypt) ;;
+    *) die "HY2_CERT_MODE must be selfsigned or letsencrypt" ;;
+  esac
+  proxy_enabled || return 0
+
+  valid_ipv4 "$VPS_IPV4" || die "VPS_IPV4 must be a valid IPv4 literal"
+  valid_port "$HY2_PORT" || die "HY2_PORT must be between 1 and 65535"
+  valid_port "$REALITY_PORT" || die "REALITY_PORT must be between 1 and 65535"
+  [[ -z "$HY2_PORTS" ]] || valid_port_range "$HY2_PORTS" ||
+    die "HY2_PORTS must be a START:END UDP range"
+  [[ -n "$HY2_PASSWORD" ]] || die "HY2_PASSWORD is required when VPS_IPV4 is set"
+  [[ -n "$HY2_OBFS_PASSWORD" ]] ||
+    die "HY2_OBFS_PASSWORD is required when VPS_IPV4 is set"
+  [[ -n "$REALITY_UUID" ]] || die "REALITY_UUID is required when VPS_IPV4 is set"
+  [[ -n "$REALITY_PUBLIC_KEY" ]] ||
+    die "REALITY_PUBLIC_KEY is required when VPS_IPV4 is set"
+  [[ -n "$REALITY_SHORT_ID" ]] ||
+    die "REALITY_SHORT_ID is required when VPS_IPV4 is set"
+  [[ -n "$REALITY_TARGET_NAME" ]] ||
+    die "REALITY_TARGET_NAME is required when VPS_IPV4 is set"
+  valid_hostname "$REALITY_TARGET_NAME" ||
+    die "REALITY_TARGET_NAME must be a valid domain name"
+  if [[ "$HY2_CERT_MODE" == "selfsigned" ]]; then
+    [[ -n "$HY2_CERT_PIN" ]] ||
+      die "HY2_CERT_PIN (server self-signed certificate PEM) is required for selfsigned HY2_CERT_MODE"
+  fi
+}
+
+# Cloudflare DDNS is optional. If a home domain is set, the Cloudflare
+# credentials become mandatory; otherwise DDNS is simply skipped.
+validate_ddns_config() {
+  [[ -n "$HOME_DOMAIN" ]] || return 0
+  valid_hostname "$HOME_DOMAIN" || die "HOME_DOMAIN must be a valid domain name"
+  [[ -n "$CLOUDFLARE_API_TOKEN" ]] ||
+    die "CLOUDFLARE_API_TOKEN is required when HOME_DOMAIN is set"
+  [[ -n "$CLOUDFLARE_ZONE_ID" ]] ||
+    die "CLOUDFLARE_ZONE_ID is required when HOME_DOMAIN is set"
+}
+
+# Public LuCI cert mode / port. Let's Encrypt uses DNS-01 via Cloudflare, so it
+# needs the same domain and credentials as the DDNS.
+validate_luci_config() {
+  valid_port "$LUCI_PUBLIC_PORT" ||
+    die "LUCI_PUBLIC_PORT must be between 1 and 65535"
+  case "$LUCI_CERT_MODE" in
+    selfsigned) ;;
+    letsencrypt)
+      [[ -n "$HOME_DOMAIN" ]] ||
+        die "LUCI_CERT_MODE=letsencrypt requires HOME_DOMAIN"
+      [[ -n "$CLOUDFLARE_API_TOKEN" && -n "$CLOUDFLARE_ZONE_ID" ]] ||
+        die "LUCI_CERT_MODE=letsencrypt requires Cloudflare credentials for DNS-01"
+      ;;
+    *) die "LUCI_CERT_MODE must be selfsigned or letsencrypt" ;;
+  esac
 }
 
 # Validates the raw peer array (name/address required, unique /32 per iface)
@@ -585,6 +747,15 @@ render_firewall_batch() {
     _setq "firewall.wg_local_in.dest_port" "$WG_LOCAL_PORT"
     _setq "firewall.wg_local_in.family" "ipv6"
     _setq "firewall.wg_local_in.target" "ACCEPT"
+
+    # Public LuCI ingress: IPv6-only TCP on WAN for the separate uhttpd instance.
+    _set "firewall.luci_public_in" "rule"
+    _setq "firewall.luci_public_in.name" "Allow-LuCI-Public-IPv6"
+    _setq "firewall.luci_public_in.src" "wan"
+    _setq "firewall.luci_public_in.proto" "tcp"
+    _setq "firewall.luci_public_in.dest_port" "$LUCI_PUBLIC_PORT"
+    _setq "firewall.luci_public_in.family" "ipv6"
+    _setq "firewall.luci_public_in.target" "ACCEPT"
   } >>"$out"
 }
 
@@ -612,6 +783,141 @@ render_uci_batch() {
   render_network_batch "$out"
   render_firewall_batch "$out"
   render_dhcp_batch "$out"
+  render_homeproxy_batch "$out"
+  render_uhttpd_batch "$out"
+  render_acme_batch "$out"
+}
+
+# ==================== HomeProxy UCI rendering ====================
+
+# Emits the HomeProxy client configuration: GFWList redirect_tproxy mode,
+# IPv4-only, the wg-global source global-proxy policy, the resource auto-update
+# cron, and the exact HY2 (default) and VLESS+REALITY+Vision (manual) nodes.
+# The package ships a default /etc/config/homeproxy with the 'config', 'dns',
+# 'subscription', and 'control' sections seeded; we redeclare each section (a
+# no-op when it already exists) and set only the options we manage, so manually
+# maintained proxy/direct lists (wan_proxy_*, lan_direct_*, resource list files)
+# are preserved. Only our own lan_global_proxy list is cleared before re-adding.
+render_homeproxy_batch() {
+  local out="$1" wg_global_net
+  proxy_enabled || return 0
+  wg_global_net="$(ipv4_network_cidr "$WG_GLOBAL_ADDRESS")"
+  {
+    # General: GFWList split, redirect_tproxy, IPv4-only, HY2 as default node.
+    _set "homeproxy.config" "homeproxy"
+    _setq "homeproxy.config.proxy_mode" "redirect_tproxy"
+    _setq "homeproxy.config.routing_mode" "gfwlist"
+    _setq "homeproxy.config.ipv6_support" "0"
+    _setq "homeproxy.config.main_node" "$HP_HY2_NODE"
+    _setq "homeproxy.config.main_udp_node" "same"
+
+    # IPv4-only DNS resolution for proxied lookups.
+    _set "homeproxy.dns" "homeproxy"
+    _setq "homeproxy.dns.dns_strategy" "ipv4_only"
+
+    # Resource/geodata auto-update via HomeProxy's cron.
+    _set "homeproxy.subscription" "homeproxy"
+    _setq "homeproxy.subscription.auto_update" "1"
+    _setq "homeproxy.subscription.auto_update_time" "4"
+
+    # Access control: the wg-global subnet is globally proxied; LAN and wg-local
+    # keep the default GFWList behaviour (lan_proxy_mode disabled). Clear only
+    # our own global-proxy list before re-adding it; leave manual lists intact.
+    _set "homeproxy.control" "homeproxy"
+    _setq "homeproxy.control.lan_proxy_mode" "disabled"
+    _del "homeproxy.control.lan_global_proxy_ipv4_ips"
+    _addlist "homeproxy.control.lan_global_proxy_ipv4_ips" "$wg_global_net"
+
+    # HY2 (Hysteria2 + Salamander) node - the default main node. IPv4 literal
+    # address keeps the dial IPv4-only.
+    _set "homeproxy.${HP_HY2_NODE}" "node"
+    _setq "homeproxy.${HP_HY2_NODE}.label" "HY2 Hysteria2 (default)"
+    _setq "homeproxy.${HP_HY2_NODE}.type" "hysteria2"
+    _setq "homeproxy.${HP_HY2_NODE}.address" "$VPS_IPV4"
+    _setq "homeproxy.${HP_HY2_NODE}.port" "$HY2_PORT"
+    _setq "homeproxy.${HP_HY2_NODE}.password" "$HY2_PASSWORD"
+    _setq "homeproxy.${HP_HY2_NODE}.hysteria_obfs_type" "salamander"
+    _setq "homeproxy.${HP_HY2_NODE}.hysteria_obfs_password" "$HY2_OBFS_PASSWORD"
+    _setq "homeproxy.${HP_HY2_NODE}.tls" "1"
+    _setq "homeproxy.${HP_HY2_NODE}.tls_sni" "${HY2_SNI:-$VPS_IPV4}"
+    _setq "homeproxy.${HP_HY2_NODE}.tls_insecure" "0"
+    if [[ -n "$HY2_PORTS" ]]; then
+      _addlist "homeproxy.${HP_HY2_NODE}.hysteria_hopping_port" "$HY2_PORTS"
+    fi
+    if [[ "$HY2_CERT_MODE" == "selfsigned" ]]; then
+      # Pin the server self-signed certificate instead of allowing insecure TLS.
+      _setq "homeproxy.${HP_HY2_NODE}.tls_self_sign" "1"
+      _setq "homeproxy.${HP_HY2_NODE}.tls_cert_path" "$HY2_CA_FILE"
+    fi
+
+    # VLESS + REALITY + Vision node - selectable manually in LuCI as main_node.
+    _set "homeproxy.${HP_REALITY_NODE}" "node"
+    _setq "homeproxy.${HP_REALITY_NODE}.label" "REALITY VLESS Vision (manual)"
+    _setq "homeproxy.${HP_REALITY_NODE}.type" "vless"
+    _setq "homeproxy.${HP_REALITY_NODE}.address" "$VPS_IPV4"
+    _setq "homeproxy.${HP_REALITY_NODE}.port" "$REALITY_PORT"
+    _setq "homeproxy.${HP_REALITY_NODE}.uuid" "$REALITY_UUID"
+    _setq "homeproxy.${HP_REALITY_NODE}.vless_flow" "xtls-rprx-vision"
+    _setq "homeproxy.${HP_REALITY_NODE}.packet_encoding" "xudp"
+    _setq "homeproxy.${HP_REALITY_NODE}.tls" "1"
+    _setq "homeproxy.${HP_REALITY_NODE}.tls_sni" "$REALITY_TARGET_NAME"
+    _setq "homeproxy.${HP_REALITY_NODE}.tls_insecure" "0"
+    _setq "homeproxy.${HP_REALITY_NODE}.tls_utls" "$REALITY_FINGERPRINT"
+    _setq "homeproxy.${HP_REALITY_NODE}.tls_reality" "1"
+    _setq "homeproxy.${HP_REALITY_NODE}.tls_reality_public_key" "$REALITY_PUBLIC_KEY"
+    _setq "homeproxy.${HP_REALITY_NODE}.tls_reality_short_id" "$REALITY_SHORT_ID"
+  } >>"$out"
+}
+
+# ==================== Public LuCI (uhttpd) UCI rendering ====================
+
+# A separate uhttpd instance bound to [::]:PORT only (IPv6-only HTTPS), distinct
+# from the factory LAN 'main' instance. No plain-HTTP listener is created.
+render_uhttpd_batch() {
+  local out="$1" crt key
+  if [[ "$LUCI_CERT_MODE" == "letsencrypt" ]]; then
+    crt="${ROOT_PREFIX}/etc/acme/${HOME_DOMAIN}/fullchain.cer"
+    key="${ROOT_PREFIX}/etc/acme/${HOME_DOMAIN}/${HOME_DOMAIN}.key"
+  else
+    crt="$LUCI_PUBLIC_CRT"
+    key="$LUCI_PUBLIC_KEY_FILE"
+  fi
+  {
+    _set "uhttpd.${LUCI_UHTTPD_INSTANCE}" "uhttpd"
+    _del "uhttpd.${LUCI_UHTTPD_INSTANCE}.listen_http"
+    _del "uhttpd.${LUCI_UHTTPD_INSTANCE}.listen_https"
+    _addlist "uhttpd.${LUCI_UHTTPD_INSTANCE}.listen_https" "[::]:${LUCI_PUBLIC_PORT}"
+    _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.redirect_https" "0"
+    _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.home" "/www"
+    _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.rfc1918_filter" "0"
+    _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.cert" "$crt"
+    _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.key" "$key"
+    _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.cgi_prefix" "/cgi-bin"
+    _addlist "uhttpd.${LUCI_UHTTPD_INSTANCE}.index_page" "index.html"
+    _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.script_timeout" "60"
+    _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.network_timeout" "30"
+    _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.http_keepalive" "20"
+    _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.tcp_keepalive" "1"
+  } >>"$out"
+}
+
+# ACME (acme.sh via luci-app-acme) cert for the public LuCI domain, issued with
+# the Cloudflare DNS-01 challenge only. Emitted only in letsencrypt mode.
+render_acme_batch() {
+  local out="$1"
+  [[ "$LUCI_CERT_MODE" == "letsencrypt" ]] || return 0
+  {
+    _set "acme.${LUCI_ACME_CERT}" "cert"
+    _setq "acme.${LUCI_ACME_CERT}.enabled" "1"
+    _del "acme.${LUCI_ACME_CERT}.domains"
+    _addlist "acme.${LUCI_ACME_CERT}.domains" "$HOME_DOMAIN"
+    _setq "acme.${LUCI_ACME_CERT}.validation_method" "dns"
+    _setq "acme.${LUCI_ACME_CERT}.dns" "dns_cf"
+    _del "acme.${LUCI_ACME_CERT}.credentials"
+    _addlist "acme.${LUCI_ACME_CERT}.credentials" "CF_Token=${CLOUDFLARE_API_TOKEN}"
+    _addlist "acme.${LUCI_ACME_CERT}.credentials" "CF_Zone_ID=${CLOUDFLARE_ZONE_ID}"
+    _setq "acme.${LUCI_ACME_CERT}.key_type" "rsa2048"
+  } >>"$out"
 }
 
 # ==================== Client template rendering ====================
@@ -676,7 +982,119 @@ validate_peer_templates() {
   return 0
 }
 
-# ==================== UCI apply / validation ====================
+# ==================== Certificate and DDNS artifacts ====================
+
+# HY2 self-signed trust anchor: HY2_CERT_PIN carries the server's self-signed
+# certificate (PEM). HomeProxy trusts it via tls_self_sign + tls_cert_path, so
+# the client never resorts to insecure TLS.
+write_hy2_ca_file() {
+  local dest="$1"
+  install -d -m 0755 "$(dirname "$dest")"
+  printf '%s\n' "$HY2_CERT_PIN" >"$dest"
+  chmod 0644 "$dest"
+}
+
+# Self-signed certificate for the public LuCI uhttpd instance (selfsigned mode).
+generate_luci_selfsigned() {
+  local crt="$1" key="$2" cn
+  cn="${HOME_DOMAIN:-immortalwrt-luci}"
+  install -d -m 0700 "$(dirname "$key")"
+  install -d -m 0755 "$(dirname "$crt")"
+  openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout "$key" -out "$crt" -days 3650 -sha256 \
+    -subj "/CN=${cn}" >/dev/null 2>&1 ||
+    die "failed to generate the self-signed LuCI certificate"
+  chmod 0600 "$key"
+  chmod 0644 "$crt"
+}
+
+# Cloudflare AAAA updater. Selects a stable global IPv6 (skipping temporary /
+# privacy / deprecated addresses) and publishes it as a DNS-only (proxied=false)
+# record. Credentials are baked into this root-only 0700 script.
+render_ddns_updater() {
+  local dest="$1"
+  install -d -m 0700 "$(dirname "$dest")"
+  {
+    printf '#!/bin/sh\n'
+    printf '%s\n' "$MANAGED_MARKER"
+    printf "DOMAIN=%q\n" "$HOME_DOMAIN"
+    printf "ZONE_ID=%q\n" "$CLOUDFLARE_ZONE_ID"
+    printf "API_TOKEN=%q\n" "$CLOUDFLARE_API_TOKEN"
+    cat <<'EOF'
+API='https://api.cloudflare.com/client/v4'
+set -eu
+
+# Stable global-scope IPv6: skip temporary/privacy, deprecated and tentative
+# addresses and ULA (fc00::/7). The LAN advertises no IPv6, so the surviving
+# GUAs are the active WAN6 addresses; take the first stable one.
+select_stable_gua() {
+	ip -6 addr show scope global 2>/dev/null | awk '
+		$1 == "inet6" {
+			a = $2; sub(/\/.*/, "", a); bad = 0
+			for (i = 3; i <= NF; i++)
+				if ($i == "temporary" || $i == "deprecated" || $i == "tentative")
+					bad = 1
+			if (bad) next
+			la = tolower(a)
+			if (la ~ /^fe80:/) next
+			if (la ~ /^f[cd]/) next
+			print a
+		}' | head -n1
+}
+
+gua="$(select_stable_gua)"
+[ -n "$gua" ] || { logger -t vpn-node-ddns "no stable global IPv6 available"; exit 0; }
+
+auth="Authorization: Bearer ${API_TOKEN}"
+records="$(curl -fsS -H "$auth" -H 'Content-Type: application/json' \
+	"${API}/zones/${ZONE_ID}/dns_records?type=AAAA&name=${DOMAIN}")" ||
+	{ logger -t vpn-node-ddns "Cloudflare query failed"; exit 1; }
+
+rec_id="$(printf '%s' "$records" | sed -n 's/.*"id":"\([0-9a-f]\{1,\}\)".*/\1/p' | head -n1)"
+body='{"type":"AAAA","name":"'"$DOMAIN"'","content":"'"$gua"'","ttl":60,"proxied":false}'
+
+if [ -n "$rec_id" ]; then
+	curl -fsS -X PUT -H "$auth" -H 'Content-Type: application/json' \
+		"${API}/zones/${ZONE_ID}/dns_records/${rec_id}" --data "$body" >/dev/null &&
+		logger -t vpn-node-ddns "updated ${DOMAIN} AAAA -> ${gua}"
+else
+	curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
+		"${API}/zones/${ZONE_ID}/dns_records" --data "$body" >/dev/null &&
+		logger -t vpn-node-ddns "created ${DOMAIN} AAAA -> ${gua}"
+fi
+EOF
+  } >"$dest"
+  chmod 0700 "$dest"
+}
+
+# Hotplug hook: run the updater when a WAN IPv6 logical interface comes up.
+render_ddns_hotplug() {
+  local dest="$1"
+  install -d -m 0755 "$(dirname "$dest")"
+  {
+    printf '#!/bin/sh\n'
+    printf '%s\n' "$MANAGED_MARKER"
+    printf '[ "$ACTION" = "ifup" ] || exit 0\n'
+    printf 'case "$INTERFACE" in\n'
+    printf '  %s|%s) %s >/dev/null 2>&1 & ;;\n' \
+      "$WAN6_IFACE" "$PPPOE6_IFACE" "$DDNS_UPDATER"
+    printf 'esac\n'
+    printf 'exit 0\n'
+  } >"$dest"
+  chmod 0755 "$dest"
+}
+
+# Root crontab with our marked DDNS line, preserving all other entries.
+render_ddns_crontab() {
+  local dest="$1"
+  install -d -m 0755 "$(dirname "$dest")"
+  : >"$dest"
+  if [[ -f "$CRONTAB_ROOT" ]]; then
+    grep -vF "$DDNS_CRON_TAG" "$CRONTAB_ROOT" >"$dest" || true
+  fi
+  printf '*/15 * * * * %s %s\n' "$DDNS_UPDATER" "$DDNS_CRON_TAG" >>"$dest"
+  chmod 0600 "$dest"
+}
 
 validate_uci_batch() {
   local file="$1" tmp
@@ -725,6 +1143,18 @@ ensure_packages() {
   pm="$(detect_pkg_manager)" ||
     die "no supported package manager (opkg/apk) found"
   local -a pkgs=(wireguard-tools kmod-wireguard luci-proto-wireguard)
+  # HomeProxy client + sing-box engine, and the DDNS framework.
+  pkgs+=(homeproxy sing-box ddns-scripts)
+  # TLS / certificate tooling depends on the public-LuCI cert mode.
+  if [[ "$LUCI_CERT_MODE" == "letsencrypt" ]]; then
+    pkgs+=(acme acme-dnsapi luci-app-acme)
+  else
+    pkgs+=(openssl-util)
+  fi
+  # The Cloudflare AAAA updater needs an HTTPS-capable curl.
+  if ddns_enabled; then
+    pkgs+=(curl ca-bundle)
+  fi
   [[ -n "$PPPOE_USERNAME" ]] && pkgs+=(ppp ppp-mod-pppoe)
   case "$pm" in
     opkg)
@@ -744,6 +1174,15 @@ reload_services() {
   service network reload || die "failed to reload network"
   service firewall reload || die "failed to reload firewall"
   service dnsmasq reload || die "failed to reload dnsmasq"
+  service uhttpd reload || die "failed to reload uhttpd"
+  if proxy_enabled; then
+    service homeproxy enable >/dev/null 2>&1 || true
+    service homeproxy restart || die "failed to restart homeproxy"
+  fi
+  if ddns_enabled; then
+    service cron enable >/dev/null 2>&1 || true
+    service cron restart >/dev/null 2>&1 || true
+  fi
 }
 
 # ==================== Transaction and rollback ====================
@@ -778,6 +1217,12 @@ begin_transaction() {
   STAGED_BATCH="${TXN_DIR}/stage/batch.uci"
   STAGED_STATE="${TXN_DIR}/stage/wg-state.env"
   STAGED_CLIENTS="${TXN_DIR}/stage/clients"
+  STAGED_HY2_CA="${TXN_DIR}/stage/hy2_server_ca.pem"
+  STAGED_LUCI_CRT="${TXN_DIR}/stage/luci-public.crt"
+  STAGED_LUCI_KEY="${TXN_DIR}/stage/luci-public.key"
+  STAGED_DDNS_SCRIPT="${TXN_DIR}/stage/cloudflare-aaaa.sh"
+  STAGED_DDNS_HOTPLUG="${TXN_DIR}/stage/99-vpn-node-ddns"
+  STAGED_DDNS_CRON="${TXN_DIR}/stage/crontab-root"
   SNAPSHOT_TARGETS=()
   SNAPSHOT_EXISTED=()
   SNAPSHOT_MODE=()
@@ -800,7 +1245,7 @@ rollback_transaction() {
   if ((TRANSACTION_ACTIVE)); then
     log "rolling back transaction"
     # Drop any uncommitted UCI staging, then restore exact config files.
-    uci -q -c "$UCI_CONFIG_DIR" revert network firewall dhcp >/dev/null 2>&1 || true
+    uci -q -c "$UCI_CONFIG_DIR" revert network firewall dhcp homeproxy uhttpd acme >/dev/null 2>&1 || true
     local path slug
     for path in "${SNAPSHOT_TARGETS[@]}"; do
       slug="$(_snapshot_key "$path")"
@@ -849,6 +1294,17 @@ stage_managed_files() {
   render_uci_batch "$STAGED_BATCH"
   render_wg_state_file "$STAGED_STATE"
   render_all_peer_templates "$STAGED_CLIENTS"
+  if proxy_enabled && [[ "$HY2_CERT_MODE" == "selfsigned" ]]; then
+    write_hy2_ca_file "$STAGED_HY2_CA"
+  fi
+  if [[ "$LUCI_CERT_MODE" == "selfsigned" ]]; then
+    generate_luci_selfsigned "$STAGED_LUCI_CRT" "$STAGED_LUCI_KEY"
+  fi
+  if ddns_enabled; then
+    render_ddns_updater "$STAGED_DDNS_SCRIPT"
+    render_ddns_hotplug "$STAGED_DDNS_HOTPLUG"
+    render_ddns_crontab "$STAGED_DDNS_CRON"
+  fi
 }
 
 validate_staged_files() {
@@ -856,6 +1312,18 @@ validate_staged_files() {
     die "staged UCI batch failed validation"
   validate_peer_templates "$STAGED_CLIENTS" ||
     die "staged WireGuard client template failed validation"
+  if [[ "$LUCI_CERT_MODE" == "selfsigned" ]]; then
+    [[ -s "$STAGED_LUCI_CRT" && -s "$STAGED_LUCI_KEY" ]] ||
+      die "public LuCI self-signed certificate was not generated"
+    openssl x509 -in "$STAGED_LUCI_CRT" -noout >/dev/null 2>&1 ||
+      die "generated public LuCI certificate is invalid"
+  fi
+  if proxy_enabled && [[ "$HY2_CERT_MODE" == "selfsigned" ]]; then
+    [[ -s "$STAGED_HY2_CA" ]] || die "HY2 self-signed trust anchor is empty"
+  fi
+  if ddns_enabled; then
+    [[ -s "$STAGED_DDNS_SCRIPT" ]] || die "Cloudflare DDNS updater was not rendered"
+  fi
 }
 
 install_staged_files() {
@@ -868,6 +1336,23 @@ install_staged_files() {
     for f in "$STAGED_CLIENTS"/*.conf; do
       _atomic_install_file 0600 "$f" "${CLIENT_TEMPLATE_DIR}/$(basename "$f")"
     done
+  fi
+  if proxy_enabled && [[ "$HY2_CERT_MODE" == "selfsigned" ]]; then
+    install -d -m 0755 "$HOMEPROXY_CERT_DIR"
+    _atomic_install_file 0644 "$STAGED_HY2_CA" "$HY2_CA_FILE"
+  fi
+  if [[ "$LUCI_CERT_MODE" == "selfsigned" ]]; then
+    install -d -m 0700 "$VPN_NODE_DIR"
+    _atomic_install_file 0644 "$STAGED_LUCI_CRT" "$LUCI_PUBLIC_CRT"
+    _atomic_install_file 0600 "$STAGED_LUCI_KEY" "$LUCI_PUBLIC_KEY_FILE"
+  fi
+  if ddns_enabled; then
+    install -d -m 0700 "$VPN_NODE_DIR"
+    _atomic_install_file 0700 "$STAGED_DDNS_SCRIPT" "$DDNS_UPDATER"
+    install -d -m 0755 "$(dirname "$DDNS_HOTPLUG")"
+    _atomic_install_file 0755 "$STAGED_DDNS_HOTPLUG" "$DDNS_HOTPLUG"
+    install -d -m 0755 "$(dirname "$CRONTAB_ROOT")"
+    _atomic_install_file 0600 "$STAGED_DDNS_CRON" "$CRONTAB_ROOT"
   fi
 }
 
@@ -887,6 +1372,19 @@ print_install_summary() {
     "$WG_LOCAL_ADDRESS" "$WG_LOCAL_PORT" "$WG_LOCAL_PUBLIC_KEY"
   printf 'WireGuard ingress is IPv6-only; requires a public IPv6 on WAN6.\n'
   printf 'Client templates: %s\n' "$CLIENT_TEMPLATE_DIR"
+  if proxy_enabled; then
+    printf 'HomeProxy: GFWList redirect_tproxy, IPv4-only; default node HY2 (%s), manual node REALITY.\n' \
+      "$HP_HY2_NODE"
+    printf 'HY2 certificate mode: %s\n' "$HY2_CERT_MODE"
+  fi
+  if ddns_enabled; then
+    printf 'Cloudflare AAAA DDNS enabled for %s (DNS-only, hotplug + cron).\n' \
+      "$HOME_DOMAIN"
+  else
+    printf 'Cloudflare AAAA DDNS: disabled (no home domain/token).\n'
+  fi
+  printf 'Public LuCI: IPv6-only HTTPS on [::]:%s (%s certificate).\n' \
+    "$LUCI_PUBLIC_PORT" "$LUCI_CERT_MODE"
   printf 'LAN moved to %s; reconnect the admin host to %s.\n' \
     "$LAN_ADDRESS" "${LAN_ADDRESS%/*}"
 }
@@ -896,8 +1394,17 @@ install_client() {
   snapshot_target "$NETWORK_CONFIG"
   snapshot_target "$FIREWALL_CONFIG"
   snapshot_target "$DHCP_CONFIG"
+  snapshot_target "$HOMEPROXY_CONFIG"
+  snapshot_target "$UHTTPD_CONFIG"
+  snapshot_target "$ACME_CONFIG"
   snapshot_target "$WG_STATE_FILE"
   snapshot_target "$CLIENT_TEMPLATE_DIR"
+  snapshot_target "$HY2_CA_FILE"
+  snapshot_target "$LUCI_PUBLIC_CRT"
+  snapshot_target "$LUCI_PUBLIC_KEY_FILE"
+  snapshot_target "$DDNS_UPDATER"
+  snapshot_target "$DDNS_HOTPLUG"
+  snapshot_target "$CRONTAB_ROOT"
   stage_managed_files
   validate_staged_files
   install_staged_files
@@ -937,6 +1444,16 @@ cmd_check() {
   render_uci_batch "$tmp/batch.uci"
   render_wg_state_file "$tmp/wg-state.env"
   render_all_peer_templates "$tmp/clients"
+  if proxy_enabled && [[ "$HY2_CERT_MODE" == "selfsigned" ]]; then
+    write_hy2_ca_file "$tmp/hy2_server_ca.pem"
+  fi
+  if [[ "$LUCI_CERT_MODE" == "selfsigned" ]]; then
+    generate_luci_selfsigned "$tmp/luci-public.crt" "$tmp/luci-public.key"
+  fi
+  if ddns_enabled; then
+    render_ddns_updater "$tmp/cloudflare-aaaa.sh"
+    render_ddns_hotplug "$tmp/99-vpn-node-ddns"
+  fi
   validate_uci_batch "$tmp/batch.uci" || die "UCI batch failed validation"
   validate_peer_templates "$tmp/clients" ||
     die "WireGuard client template failed validation"
