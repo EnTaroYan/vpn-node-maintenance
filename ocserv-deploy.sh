@@ -771,6 +771,27 @@ begin_transaction() {
   trap 'rollback_transaction 143' TERM
 }
 
+# Tears down the ocserv network state that this tool owns. Used during
+# rollback so a failed install never leaves our nftables table applied on the
+# host. It prefers the managed helper's own "down" (the single source of truth
+# for teardown); only if that helper is missing, unmanaged, or fails does it
+# fall back to deleting the table directly, and even then ONLY when the
+# sentinel chain proves the table is ours. A table we do not own is never
+# touched. Returns nonzero when owned state could not be cleaned up.
+cleanup_owned_network_state() {
+  if [[ -x "$NETWORK_HELPER" ]] && is_managed_file "$NETWORK_HELPER"; then
+    if "$NETWORK_HELPER" down; then
+      return 0
+    fi
+  fi
+  if nft list chain ip vpn_node_ocserv _managed_by_vpn_node_maintenance \
+      >/dev/null 2>&1; then
+    nft delete table ip vpn_node_ocserv || return 1
+    return 0
+  fi
+  return 1
+}
+
 # Idempotent, trap-guarded rollback. Restores every snapshotted target to
 # its prior state (or removes it if it did not exist before), reloads
 # systemd, and restores the previous enabled/active service state.
@@ -784,6 +805,8 @@ rollback_transaction() {
   set +e
   if ((TRANSACTION_ACTIVE)); then
     log "rolling back transaction"
+    cleanup_owned_network_state ||
+      log "WARNING: could not fully clean ocserv network state during rollback"
     local path slug
     for path in "${SNAPSHOT_TARGETS[@]}"; do
       slug="$(_snapshot_key "$path")"
@@ -903,13 +926,44 @@ activate_service() {
   systemctl restart ocserv.service
 }
 
-verify_service() {
-  systemctl is-active --quiet ocserv.service ||
-    die "ocserv.service is not active after restart"
-  [[ -n "$(ss -H -ltn "sport = :${OCSERV_PORT}")" ]] ||
-    die "no TCP listener on port ${OCSERV_PORT}"
-  [[ -n "$(ss -H -lun "sport = :${OCSERV_PORT}")" ]] ||
-    die "no UDP listener on port ${OCSERV_PORT}"
+# ocserv runs under systemd Type=simple, so "systemctl restart" returns as
+# soon as the process is forked, well before ocserv has parsed its config and
+# bound its TCP and UDP listeners. A single post-restart check therefore races
+# the daemon and spuriously fails ("no TCP listener on port ..."). These two
+# knobs bound the readiness wait to 15 seconds (75 attempts x 0.2s); tests
+# shorten them via the environment. They are plain (non-readonly) assignments
+# so a test can lower them after sourcing this script.
+READINESS_ATTEMPTS="${READINESS_ATTEMPTS:-75}"
+READINESS_INTERVAL_SECONDS="${READINESS_INTERVAL_SECONDS:-0.2}"
+
+# A single readiness probe: the service is ready only when systemd reports it
+# active AND it is listening on both TCP and UDP for the configured port.
+service_is_ready() {
+  systemctl is-active --quiet ocserv.service &&
+    [[ -n "$(ss -H -ltn "sport = :${OCSERV_PORT}")" ]] &&
+    [[ -n "$(ss -H -lun "sport = :${OCSERV_PORT}")" ]]
+}
+
+# Emits systemd status and the tail of the ocserv journal to stderr so a
+# readiness timeout leaves actionable diagnostics behind. Never fails the
+# caller: this only runs on the error path just before we die.
+print_readiness_diagnostics() {
+  systemctl status ocserv.service --no-pager -l >&2 || true
+  journalctl -u ocserv.service -n 50 --no-pager >&2 || true
+}
+
+# Bounded readiness poll replacing the old one-shot verify_service. Returns as
+# soon as the service is ready; on timeout it prints diagnostics and dies
+# (which triggers the transactional rollback).
+wait_for_service_ready() {
+  local attempt
+  for ((attempt=1; attempt<=READINESS_ATTEMPTS; attempt++)); do
+    service_is_ready && return 0
+    ((attempt < READINESS_ATTEMPTS)) &&
+      sleep "$READINESS_INTERVAL_SECONDS"
+  done
+  print_readiness_diagnostics
+  die "ocserv did not become ready on TCP and UDP port ${OCSERV_PORT} within 15 seconds"
 }
 
 print_install_summary() {
@@ -950,7 +1004,7 @@ install_server() {
   ensure_initial_user "$STAGED_OCSERV_PASSWD"
   install_staged_files
   activate_service
-  verify_service
+  wait_for_service_ready
   commit_transaction
   print_install_summary
 }

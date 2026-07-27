@@ -2240,6 +2240,83 @@ ${extra}
   # redefine these two functions again after calling this fixture.
   stdin_is_terminal() { return 0; }
   read_config_replacement_answer() { CONFIG_REPLACEMENT_ANSWER="y"; }
+  # Shorten the readiness poll for every orchestration/install_server test so
+  # the 15s production wait (75 x 0.2s) never runs under the suite. Plain
+  # (non-exported) globals are inherited by the "( install_server )" subshells.
+  READINESS_ATTEMPTS=3
+  READINESS_INTERVAL_SECONDS=0
+}
+
+# Managed, executable network-helper stub for cleanup_owned_network_state
+# tests. Carries the management marker (so is_managed_file matches), logs each
+# invocation, and exits with the requested code so "down" success/failure can
+# both be simulated without touching the real helper or host firewall.
+_install_managed_network_helper() {
+  local down_rc="${1:-0}"
+  install -d -m 0755 "$(dirname "$NETWORK_HELPER")"
+  cat >"$NETWORK_HELPER" <<HELPER_EOF
+#!/usr/bin/env bash
+$MANAGED_MARKER
+printf 'ARGS: %s\n' "\$*" >> "$TEST_ROOT/helper-invocations.log"
+exit $down_rc
+HELPER_EOF
+  chmod 0755 "$NETWORK_HELPER"
+}
+
+# State-advancing systemctl/ss/journalctl doubles for the readiness poll.
+# A per-attempt counter (bumped once per "is-active" call, which service_is_ready
+# invokes first each attempt) lets ss report the listeners as absent until the
+# attempt reaches "$TEST_ROOT/ctl/ready_at", modelling a daemon that binds a few
+# hundred milliseconds after "systemctl restart" returns.
+_write_readiness_mocks() {
+  mkdir -p "$TEST_ROOT/ctl"
+  cat >"$TEST_ROOT/bin/systemctl" <<'MOCK_EOF'
+#!/usr/bin/env bash
+printf 'ARGS: %s\n' "$*" >> "$TEST_ROOT/systemctl-args.log"
+ctl="$TEST_ROOT/ctl"; mkdir -p "$ctl"
+case "$1" in
+  is-active)
+    n=$(cat "$ctl/attempt" 2>/dev/null || echo 0); n=$((n + 1))
+    printf '%s' "$n" >"$ctl/attempt"
+    [[ -f "$ctl/inactive" ]] && exit 1
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+MOCK_EOF
+
+  cat >"$TEST_ROOT/bin/ss" <<'MOCK_EOF'
+#!/usr/bin/env bash
+printf 'ARGS: %s\n' "$*" >> "$TEST_ROOT/ss-args.log"
+ctl="$TEST_ROOT/ctl"
+flags="$2"
+[[ "$flags" == *p* ]] && exit 0
+if [[ "$flags" == *t* && -f "$ctl/no_tcp" ]]; then exit 0; fi
+if [[ "$flags" == *u* && -f "$ctl/no_udp" ]]; then exit 0; fi
+attempt=$(cat "$ctl/attempt" 2>/dev/null || echo 0)
+ready_at=$(cat "$ctl/ready_at" 2>/dev/null || echo 1)
+if ((attempt >= ready_at)); then
+  printf 'LISTEN 0 128 0.0.0.0:%s 0.0.0.0:*\n' "${OCSERV_PORT:-8443}"
+fi
+exit 0
+MOCK_EOF
+
+  cat >"$TEST_ROOT/bin/journalctl" <<'MOCK_EOF'
+#!/usr/bin/env bash
+printf 'ARGS: %s\n' "$*" >> "$TEST_ROOT/journalctl-args.log"
+exit 0
+MOCK_EOF
+  chmod +x "$TEST_ROOT/bin/systemctl" "$TEST_ROOT/bin/ss" "$TEST_ROOT/bin/journalctl"
+}
+
+# Readiness fixture: orchestration config/PATH plus the state-advancing doubles
+# and a "sleep" override that records calls (and never actually delays) so
+# tests can assert on the poll's sleep behaviour.
+_readiness_fixture() {
+  _orchestration_fixture selfsigned
+  _write_readiness_mocks
+  READINESS_ATTEMPTS=3
+  READINESS_INTERVAL_SECONDS=0
+  sleep() { printf 'x' >>"$TEST_ROOT/ctl/sleep.log"; }
 }
 
 _seed_prior_managed_files() {
@@ -2422,37 +2499,76 @@ test_activate_service_order() {
   return "$ok"
 }
 
-test_verify_service_success() {
+# ---------- readiness poll (replaces the one-shot verify_service) ----------
+
+# Empty listeners on the first attempt, then TCP+UDP present -> success. This
+# is the delayed-listener race the old one-shot check failed; the poll must
+# retry and succeed.
+test_wait_for_service_ready_empty_then_listeners_succeeds() {
   new_fixture
   trap 'rm -rf -- "$TEST_ROOT"' EXIT
-  _orchestration_fixture selfsigned
-  touch "$TEST_ROOT/ctl/is_active"
-  assert_success verify_service
+  _readiness_fixture
+  printf '2' >"$TEST_ROOT/ctl/ready_at"
+  local ok=0
+  assert_success wait_for_service_ready || ok=1
+  [[ -s "$TEST_ROOT/ctl/sleep.log" ]] ||
+    { fail "the poll must sleep at least once while waiting for the listeners"; ok=1; }
+  return "$ok"
 }
 
-test_verify_service_requires_active() {
+# Ready on the very first attempt -> return immediately, never sleep.
+test_wait_for_service_ready_first_check_no_sleep() {
   new_fixture
   trap 'rm -rf -- "$TEST_ROOT"' EXIT
-  _orchestration_fixture selfsigned
-  assert_failure verify_service
+  _readiness_fixture
+  printf '1' >"$TEST_ROOT/ctl/ready_at"
+  local ok=0
+  assert_success wait_for_service_ready || ok=1
+  [[ ! -e "$TEST_ROOT/ctl/sleep.log" ]] ||
+    { fail "a service ready on the first check must not sleep"; ok=1; }
+  return "$ok"
 }
 
-test_verify_service_requires_tcp_listener() {
+# TCP listener never appears through the whole poll -> failure.
+test_wait_for_service_ready_tcp_absent_fails() {
   new_fixture
   trap 'rm -rf -- "$TEST_ROOT"' EXIT
-  _orchestration_fixture selfsigned
-  touch "$TEST_ROOT/ctl/is_active"
+  _readiness_fixture
   touch "$TEST_ROOT/ctl/no_tcp"
-  assert_failure verify_service
+  assert_failure wait_for_service_ready
 }
 
-test_verify_service_requires_udp_listener() {
+# UDP listener never appears through the whole poll -> failure.
+test_wait_for_service_ready_udp_absent_fails() {
   new_fixture
   trap 'rm -rf -- "$TEST_ROOT"' EXIT
-  _orchestration_fixture selfsigned
-  touch "$TEST_ROOT/ctl/is_active"
+  _readiness_fixture
   touch "$TEST_ROOT/ctl/no_udp"
-  assert_failure verify_service
+  assert_failure wait_for_service_ready
+}
+
+# Service never becomes active through the whole poll -> failure.
+test_wait_for_service_ready_inactive_fails() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _readiness_fixture
+  touch "$TEST_ROOT/ctl/inactive"
+  assert_failure wait_for_service_ready
+}
+
+# A readiness timeout must emit systemctl status and journalctl diagnostics.
+test_wait_for_service_ready_timeout_prints_diagnostics() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _readiness_fixture
+  touch "$TEST_ROOT/ctl/inactive"
+  ( wait_for_service_ready ) >/dev/null 2>&1 || true
+  local ok=0
+  grep -qF 'ARGS: status ocserv.service --no-pager -l' "$TEST_ROOT/systemctl-args.log" ||
+    { fail "a readiness timeout must print systemctl status diagnostics"; ok=1; }
+  [[ -f "$TEST_ROOT/journalctl-args.log" ]] ||
+    { fail "a readiness timeout must print journalctl diagnostics"; ok=1; }
+  return "$ok"
 }
 
 # ---------- rollback on failure ----------
@@ -2660,6 +2776,118 @@ test_rollback_restores_active_enabled_state() {
     { fail "rollback must restore the previously enabled state"; ok=1; }
   grep -qFx 'ARGS: restart ocserv.service' "$TEST_ROOT/systemctl-args.log" ||
     { fail "rollback must restart the previously active service"; ok=1; }
+  return "$ok"
+}
+
+# ---------- rollback network cleanup (owned nftables table) ----------
+
+# A managed, executable helper owns teardown: cleanup must invoke its "down"
+# and must NOT delete the table directly (the helper is the single source of
+# truth for teardown).
+test_cleanup_managed_helper_invokes_down() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _install_managed_network_helper 0
+  _seed_owned_table
+  local ok=0
+  assert_success cleanup_owned_network_state || ok=1
+  grep -qFx 'ARGS: down' "$TEST_ROOT/helper-invocations.log" 2>/dev/null ||
+    { fail "a managed helper must have its down invoked"; ok=1; }
+  ! grep -qF 'ARGS: delete table ip vpn_node_ocserv' "$TEST_ROOT/nft-args.log" 2>/dev/null ||
+    { fail "cleanup must delegate teardown to the managed helper, not delete directly"; ok=1; }
+  return "$ok"
+}
+
+# Helper absent: cleanup falls back to deleting our own table, but only after
+# the sentinel chain proves ownership.
+test_cleanup_absent_helper_deletes_sentinel_table() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  rm -f -- "$NETWORK_HELPER"
+  _seed_owned_table
+  local ok=0
+  assert_success cleanup_owned_network_state || ok=1
+  grep -qF 'ARGS: delete table ip vpn_node_ocserv' "$TEST_ROOT/nft-args.log" 2>/dev/null ||
+    { fail "an owned table must be deleted when no helper is present"; ok=1; }
+  assert_failure nft list table ip vpn_node_ocserv || ok=1
+  return "$ok"
+}
+
+# Helper present but its "down" fails: cleanup falls back to the sentinel-guarded
+# direct deletion.
+test_cleanup_helper_failure_falls_back_to_sentinel() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _install_managed_network_helper 1
+  _seed_owned_table
+  local ok=0
+  assert_success cleanup_owned_network_state || ok=1
+  grep -qFx 'ARGS: down' "$TEST_ROOT/helper-invocations.log" 2>/dev/null ||
+    { fail "the managed helper down must be attempted before the fallback"; ok=1; }
+  grep -qF 'ARGS: delete table ip vpn_node_ocserv' "$TEST_ROOT/nft-args.log" 2>/dev/null ||
+    { fail "a failed helper down must fall back to the sentinel-guarded deletion"; ok=1; }
+  assert_failure nft list table ip vpn_node_ocserv || ok=1
+  return "$ok"
+}
+
+# An unknown table with no sentinel chain is never deleted and cleanup reports
+# failure.
+test_cleanup_unknown_table_not_deleted() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  rm -f -- "$NETWORK_HELPER"
+  _seed_unowned_table
+  local ok=0
+  assert_failure cleanup_owned_network_state || ok=1
+  ! grep -qF 'ARGS: delete table ip vpn_node_ocserv' "$TEST_ROOT/nft-args.log" 2>/dev/null ||
+    { fail "a table without our sentinel chain must never be deleted"; ok=1; }
+  assert_success nft list table ip vpn_node_ocserv || ok=1
+  return "$ok"
+}
+
+# A network-cleanup failure must not abort rollback: files and service state
+# are still restored, and the unowned table is left untouched.
+test_rollback_continues_despite_network_cleanup_failure() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _seed_prior_managed_files
+  _seed_unowned_table
+  touch "$TEST_ROOT/ctl/testconfig_fail"
+  local rc=0
+  ( install_server ) </dev/null >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "install_server must fail when the config check fails"; ok=1; }
+  _assert_prior_files_restored || ok=1
+  assert_success nft list table ip vpn_node_ocserv || ok=1
+  grep -qFx 'ARGS: disable ocserv.service' "$TEST_ROOT/systemctl-args.log" ||
+    { fail "rollback must still restore the prior disabled service state"; ok=1; }
+  grep -qFx 'ARGS: stop ocserv.service' "$TEST_ROOT/systemctl-args.log" ||
+    { fail "rollback must still stop the previously inactive service"; ok=1; }
+  return "$ok"
+}
+
+# When the prior service was inactive, a rollback that runs after our table was
+# applied must leave no owned table behind.
+test_rollback_inactive_prior_leaves_no_owned_table() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _seed_prior_managed_files
+  _seed_owned_table
+  touch "$TEST_ROOT/ctl/testconfig_fail"
+  local rc=0
+  ( install_server ) </dev/null >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "install_server must fail when the config check fails"; ok=1; }
+  _assert_prior_files_restored || ok=1
+  assert_failure nft list table ip vpn_node_ocserv || ok=1
+  grep -qFx 'ARGS: stop ocserv.service' "$TEST_ROOT/systemctl-args.log" ||
+    { fail "rollback must stop the previously inactive service"; ok=1; }
   return "$ok"
 }
 
@@ -2916,10 +3144,12 @@ run_test "config validated in staging before replacement" test_install_validates
 run_test "empty database creates initial user" test_install_empty_db_creates_initial_user
 run_test "non-empty database preserved" test_install_nonempty_db_preserved
 run_test "activation order is reload/enable/restart" test_activate_service_order
-run_test "verify succeeds when active with listeners" test_verify_service_success
-run_test "verify requires active service" test_verify_service_requires_active
-run_test "verify requires TCP listener" test_verify_service_requires_tcp_listener
-run_test "verify requires UDP listener" test_verify_service_requires_udp_listener
+run_test "readiness poll retries until listeners appear" test_wait_for_service_ready_empty_then_listeners_succeeds
+run_test "readiness ready on first check does not sleep" test_wait_for_service_ready_first_check_no_sleep
+run_test "readiness fails when TCP listener never appears" test_wait_for_service_ready_tcp_absent_fails
+run_test "readiness fails when UDP listener never appears" test_wait_for_service_ready_udp_absent_fails
+run_test "readiness fails when service never becomes active" test_wait_for_service_ready_inactive_fails
+run_test "readiness timeout prints status/journal diagnostics" test_wait_for_service_ready_timeout_prints_diagnostics
 run_test "config-check failure rolls back" test_rollback_on_config_check_failure
 run_test "nft-check failure rolls back" test_rollback_on_nft_check_failure
 run_test "user-creation failure rolls back" test_rollback_on_user_creation_failure
@@ -2930,6 +3160,12 @@ run_test "INT triggers rollback" test_rollback_on_int_signal
 run_test "TERM triggers rollback" test_rollback_on_term_signal
 run_test "rollback restores inactive/disabled state" test_rollback_restores_inactive_disabled_state
 run_test "rollback restores active/enabled state" test_rollback_restores_active_enabled_state
+run_test "cleanup invokes managed helper down" test_cleanup_managed_helper_invokes_down
+run_test "cleanup deletes sentinel table when helper absent" test_cleanup_absent_helper_deletes_sentinel_table
+run_test "cleanup falls back to sentinel deletion on helper failure" test_cleanup_helper_failure_falls_back_to_sentinel
+run_test "cleanup never deletes unknown table" test_cleanup_unknown_table_not_deleted
+run_test "rollback continues despite network cleanup failure" test_rollback_continues_despite_network_cleanup_failure
+run_test "inactive prior rollback leaves no owned table" test_rollback_inactive_prior_leaves_no_owned_table
 run_test "self-signed creates no hook" test_selfsigned_install_creates_no_hook
 run_test "letsencrypt creates managed hook" test_letsencrypt_install_creates_managed_hook
 run_test "switch LE to selfsigned removes managed hook" test_switch_le_to_selfsigned_removes_managed_hook
