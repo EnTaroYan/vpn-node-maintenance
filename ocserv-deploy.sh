@@ -930,11 +930,13 @@ activate_service() {
 # soon as the process is forked, well before ocserv has parsed its config and
 # bound its TCP and UDP listeners. A single post-restart check therefore races
 # the daemon and spuriously fails ("no TCP listener on port ..."). These two
-# knobs bound the readiness wait to 15 seconds (75 attempts x 0.2s); tests
-# shorten them via the environment. They are plain (non-readonly) assignments
-# so a test can lower them after sourcing this script.
-READINESS_ATTEMPTS="${READINESS_ATTEMPTS:-75}"
-READINESS_INTERVAL_SECONDS="${READINESS_INTERVAL_SECONDS:-0.2}"
+# seams fix the readiness cadence at 75 attempts x 0.2s (a 15 second bound).
+# They are functions, not variables, so the production cadence cannot be
+# reconfigured through the environment (which could reintroduce the race or
+# bypass the bounded wait). A test overrides the cadence by redefining these
+# functions after sourcing this script; the environment has no effect.
+readiness_attempts() { printf '75'; }
+readiness_interval_seconds() { printf '0.2'; }
 
 # A single readiness probe: the service is ready only when systemd reports it
 # active AND it is listening on both TCP and UDP for the configured port.
@@ -955,15 +957,32 @@ print_readiness_diagnostics() {
 # Bounded readiness poll replacing the old one-shot verify_service. Returns as
 # soon as the service is ready; on timeout it prints diagnostics and dies
 # (which triggers the transactional rollback).
+
+# Summarises the current readiness signals (systemd active state plus TCP and
+# UDP listeners on the configured port) as "active=.. tcp=.. udp=..". The
+# timeout diagnostic embeds this so an operator sees exactly which component is
+# still missing rather than vague fixed text.
+service_status_summary() {
+  local active=no tcp=no udp=no
+  if systemctl is-active --quiet ocserv.service; then active=yes; fi
+  if [[ -n "$(ss -H -ltn "sport = :${OCSERV_PORT}")" ]]; then tcp=yes; fi
+  if [[ -n "$(ss -H -lun "sport = :${OCSERV_PORT}")" ]]; then udp=yes; fi
+  printf 'active=%s tcp=%s udp=%s' "$active" "$tcp" "$udp"
+}
+
 wait_for_service_ready() {
-  local attempt
-  for ((attempt=1; attempt<=READINESS_ATTEMPTS; attempt++)); do
+  local attempt attempts interval timeout
+  attempts="$(readiness_attempts)"
+  interval="$(readiness_interval_seconds)"
+  for ((attempt=1; attempt<=attempts; attempt++)); do
     service_is_ready && return 0
-    ((attempt < READINESS_ATTEMPTS)) &&
-      sleep "$READINESS_INTERVAL_SECONDS"
+    ((attempt < attempts)) &&
+      sleep "$interval"
   done
   print_readiness_diagnostics
-  die "ocserv did not become ready on TCP and UDP port ${OCSERV_PORT} within 15 seconds"
+  # Timeout bound derived from the seam defaults (75 x 0.2s = ~15s in production).
+  timeout="$(awk "BEGIN { printf \"%g\", ${attempts} * ${interval} }")"
+  die "ocserv did not become ready on TCP and UDP port ${OCSERV_PORT}: ${attempts} attempts exhausted (~${timeout}s); last status: $(service_status_summary)"
 }
 
 print_install_summary() {

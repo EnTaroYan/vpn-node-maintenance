@@ -2241,10 +2241,11 @@ ${extra}
   stdin_is_terminal() { return 0; }
   read_config_replacement_answer() { CONFIG_REPLACEMENT_ANSWER="y"; }
   # Shorten the readiness poll for every orchestration/install_server test so
-  # the 15s production wait (75 x 0.2s) never runs under the suite. Plain
-  # (non-exported) globals are inherited by the "( install_server )" subshells.
-  READINESS_ATTEMPTS=3
-  READINESS_INTERVAL_SECONDS=0
+  # the 15s production wait (75 x 0.2s) never runs under the suite. The seams
+  # are functions and the environment has no effect; redefining them here is
+  # inherited by the "( install_server )" subshells.
+  readiness_attempts() { printf '3'; }
+  readiness_interval_seconds() { printf '0'; }
 }
 
 # Managed, executable network-helper stub for cleanup_owned_network_state
@@ -2314,8 +2315,8 @@ MOCK_EOF
 _readiness_fixture() {
   _orchestration_fixture selfsigned
   _write_readiness_mocks
-  READINESS_ATTEMPTS=3
-  READINESS_INTERVAL_SECONDS=0
+  readiness_attempts() { printf '3'; }
+  readiness_interval_seconds() { printf '0'; }
   sleep() { printf 'x' >>"$TEST_ROOT/ctl/sleep.log"; }
 }
 
@@ -2568,6 +2569,42 @@ test_wait_for_service_ready_timeout_prints_diagnostics() {
     { fail "a readiness timeout must print systemctl status diagnostics"; ok=1; }
   [[ -f "$TEST_ROOT/journalctl-args.log" ]] ||
     { fail "a readiness timeout must print journalctl diagnostics"; ok=1; }
+  grep -qF 'ARGS: -u ocserv.service -n 50 --no-pager' "$TEST_ROOT/journalctl-args.log" ||
+    { fail "journalctl diagnostics must use exact args -u ocserv.service -n 50 --no-pager"; ok=1; }
+  return "$ok"
+}
+
+# The readiness cadence is fixed by the readiness_attempts /
+# readiness_interval_seconds function seams so a production run cannot be
+# reconfigured through the environment (which could reintroduce the race or
+# bypass the bounded wait). Setting the old READINESS_* environment variables
+# must have no effect; only redefining the seams (as the tests do) changes it.
+test_readiness_defaults_ignore_environment() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  source_deployer
+  local ok=0
+  assert_eq "75" "$(READINESS_ATTEMPTS=1 readiness_attempts)" \
+    "readiness_attempts must ignore the environment and return the fixed default" || ok=1
+  assert_eq "0.2" "$(READINESS_INTERVAL_SECONDS=99 readiness_interval_seconds)" \
+    "readiness_interval_seconds must ignore the environment and return the fixed default" || ok=1
+  return "$ok"
+}
+
+# A readiness timeout must report the concrete active/tcp/udp status it observed
+# rather than vague fixed text, and must state that the bounded attempts were
+# exhausted (the ~15s production bound is derived from the seam defaults).
+test_wait_for_service_ready_timeout_reports_component_status() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _readiness_fixture
+  touch "$TEST_ROOT/ctl/inactive"
+  local err ok=0
+  err="$( ( wait_for_service_ready ) 2>&1 >/dev/null || true )"
+  [[ "$err" == *"active="* && "$err" == *"tcp="* && "$err" == *"udp="* ]] ||
+    { fail "timeout message must report active/tcp/udp status (got: $err)"; ok=1; }
+  [[ "$err" == *"attempts exhausted"* ]] ||
+    { fail "timeout message must state the bounded attempts were exhausted (got: $err)"; ok=1; }
   return "$ok"
 }
 
@@ -3150,6 +3187,8 @@ run_test "readiness fails when TCP listener never appears" test_wait_for_service
 run_test "readiness fails when UDP listener never appears" test_wait_for_service_ready_udp_absent_fails
 run_test "readiness fails when service never becomes active" test_wait_for_service_ready_inactive_fails
 run_test "readiness timeout prints status/journal diagnostics" test_wait_for_service_ready_timeout_prints_diagnostics
+run_test "readiness defaults ignore the environment" test_readiness_defaults_ignore_environment
+run_test "readiness timeout reports active/tcp/udp status" test_wait_for_service_ready_timeout_reports_component_status
 run_test "config-check failure rolls back" test_rollback_on_config_check_failure
 run_test "nft-check failure rolls back" test_rollback_on_nft_check_failure
 run_test "user-creation failure rolls back" test_rollback_on_user_creation_failure
