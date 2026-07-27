@@ -102,6 +102,9 @@ sudo ./ocserv-deploy.sh add-user USERNAME
 sudo ./ocserv-deploy.sh del-user USERNAME
 ```
 
+若 `/etc/ocserv/ocserv.conf` 已存在，安装器会要求输入 y 确认，先备份原配置，
+再用新配置替换；无交互终端时会中止。
+
 Azure 或云平台防火墙须同时放行 `OCSERV_PORT` 的 TCP 和 UDP 入站。
 
 固定 IP/域名且使用 `selfsigned` 模式时可跳过步骤 1 和 2，直接执行此步骤。

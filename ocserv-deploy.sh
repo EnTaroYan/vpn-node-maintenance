@@ -38,6 +38,11 @@ TRANSACTION_ACTIVE=0
 ROLLBACK_RUNNING=0
 SERVICE_WAS_ACTIVE=0
 SERVICE_WAS_ENABLED=0
+# Set to 1 only after check_existing_config obtains an interactive y/Y
+# confirmation and successfully backs up an existing config; reset to 0 at
+# the start of every check_existing_config call so stale confirmation state
+# can never leak into a later, unconfirmed run.
+CONFIG_REPLACEMENT_CONFIRMED=0
 declare -ga SNAPSHOT_TARGETS=()
 declare -gA SNAPSHOT_EXISTED=()
 declare -gA SNAPSHOT_MODE=()
@@ -455,15 +460,58 @@ is_managed_file() {
   [[ -f "$path" ]] && grep -Fqx "$MANAGED_MARKER" "$path"
 }
 
+# Seam: real TTY check. Unit tests override this after sourcing to simulate
+# an interactive terminal (or force the non-interactive path) without any
+# production environment variable or CLI bypass.
+stdin_is_terminal() {
+  [[ -t 0 ]]
+}
+
+# Seam: real interactive prompt/read. Unit tests override this after
+# sourcing to inject a canned CONFIG_REPLACEMENT_ANSWER or simulate a read
+# failure (EOF), again with no production bypass.
+read_config_replacement_answer() {
+  local prompt="$1"
+  IFS= read -r -p "$prompt" CONFIG_REPLACEMENT_ANSWER
+}
+
+# Produces a collision-safe backup path for OCSERV_CONF: a UTC timestamp to
+# the second, with a numeric ".N" suffix appended if that exact path is
+# already taken (e.g. two runs within the same second).
+next_config_backup_path() {
+  local timestamp base candidate suffix=0
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  base="${OCSERV_CONF}.pre-vpn-node-${timestamp}"
+  candidate="${base}.bak"
+  while [[ -e "$candidate" || -L "$candidate" ]]; do
+    suffix=$((suffix + 1))
+    candidate="${base}.${suffix}.bak"
+  done
+  printf '%s\n' "$candidate"
+}
+
 check_existing_config() {
-  if [[ -e "$OCSERV_CONF" ]]; then
-    if ! is_managed_file "$OCSERV_CONF"; then
-      local backup
-      backup="${OCSERV_CONF}.pre-vpn-node-$(date -u +%Y%m%dT%H%M%SZ).bak"
-      cp -a -- "$OCSERV_CONF" "$backup"
-      die "existing unmanaged ocserv config backed up to $backup; refusing to overwrite"
-    fi
-  fi
+  CONFIG_REPLACEMENT_CONFIRMED=0
+  [[ -e "$OCSERV_CONF" || -L "$OCSERV_CONF" ]] || return 0
+  stdin_is_terminal ||
+    die "existing ocserv config requires interactive replacement confirmation: $OCSERV_CONF"
+
+  CONFIG_REPLACEMENT_ANSWER=""
+  read_config_replacement_answer \
+    "Existing config $OCSERV_CONF will be backed up and replaced. Continue? [y/N] " ||
+    die "could not read config replacement confirmation"
+
+  case "$CONFIG_REPLACEMENT_ANSWER" in
+    y|Y) ;;
+    *) die "config replacement declined" ;;
+  esac
+
+  local backup
+  backup="$(next_config_backup_path)"
+  cp -a -- "$OCSERV_CONF" "$backup" ||
+    die "failed to back up existing ocserv config to $backup"
+  CONFIG_REPLACEMENT_CONFIRMED=1
+  log "Existing ocserv config backed up to $backup"
 }
 
 render_ocserv_config() {
@@ -557,8 +605,10 @@ check_route_overlap() {
 }
 
 _configured_ocserv_port() {
-  is_managed_file "$OCSERV_CONF" || return 1
-  awk -F' = ' '$1 == "tcp-port" { print $2; found=1 } END { exit !found }' "$OCSERV_CONF"
+  ((CONFIG_REPLACEMENT_CONFIRMED == 1)) || return 1
+  [[ -f "$OCSERV_CONF" ]] || return 1
+  awk -F' = ' '$1 == "tcp-port" { print $2; found=1 } END { exit !found }' \
+    "$OCSERV_CONF"
 }
 
 check_port_available() {

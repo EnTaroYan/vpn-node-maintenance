@@ -1059,38 +1059,211 @@ test_render_ocserv_config_route_and_no_compression() {
 }
 
 # ---------- check_existing_config ----------
+#
+# check_existing_config now requires an interactive y/Y confirmation before
+# replacing *any* existing config (managed or not), permanently backs it up
+# with cp -a (collision-safe, content/mode/mtime preserving) before allowing
+# replacement, and tracks confirmation in CONFIG_REPLACEMENT_CONFIRMED so
+# check_port_available can allow a same-port ocserv rerun. Production has no
+# environment or CLI bypass for the prompt: unit tests override the two
+# seam functions stdin_is_terminal/read_config_replacement_answer.
 
-test_check_existing_config_unknown_backed_up_and_fails() {
-  new_fixture
-  trap remove_fixture EXIT
-  source_deployer
-  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
-  printf 'some unmanaged content\n' >"$OCSERV_CONF"
-  local ok=0
-  assert_failure check_existing_config || ok=1
+_no_backups_exist() {
   local backups
   backups=("${OCSERV_CONF}".pre-vpn-node-*.bak)
-  [[ -f "${backups[0]}" ]] ||
-    { fail "unmanaged config must be backed up before failing"; ok=1; }
-  grep -qF "some unmanaged content" "${backups[0]}" 2>/dev/null ||
-    { fail "backup must contain the original unmanaged content"; ok=1; }
-  return "$ok"
-}
-
-test_check_existing_config_managed_accepted() {
-  new_fixture
-  trap remove_fixture EXIT
-  source_deployer
-  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
-  printf '%s\n' "$MANAGED_MARKER" >"$OCSERV_CONF"
-  assert_success check_existing_config
+  [[ ! -e "${backups[0]}" ]]
 }
 
 test_check_existing_config_absent_passes() {
   new_fixture
   trap remove_fixture EXIT
   source_deployer
+  # A stale CONFIG_REPLACEMENT_CONFIRMED=1 from an earlier call must never
+  # leak forward: the absent-config path must reset it back to 0.
+  CONFIG_REPLACEMENT_CONFIRMED=1
+  local ok=0
+  assert_success check_existing_config || ok=1
+  assert_eq "0" "$CONFIG_REPLACEMENT_CONFIRMED" \
+    "absent config must reset stale confirmation state" || ok=1
+  _no_backups_exist ||
+    { fail "absent config must never create a backup"; ok=1; }
+  return "$ok"
+}
+
+test_check_existing_config_managed_confirmed_lowercase_y_backs_up() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf '%s\nPRIOR-MANAGED\n' "$MANAGED_MARKER" >"$OCSERV_CONF"
+  stdin_is_terminal() { return 0; }
+  read_config_replacement_answer() { CONFIG_REPLACEMENT_ANSWER="y"; }
+  local ok=0
+  assert_success check_existing_config || ok=1
+  assert_eq "1" "$CONFIG_REPLACEMENT_CONFIRMED" \
+    "lowercase y confirmation must set CONFIG_REPLACEMENT_CONFIRMED=1" || ok=1
+  local backups
+  backups=("${OCSERV_CONF}".pre-vpn-node-*.bak)
+  [[ -f "${backups[0]}" ]] ||
+    { fail "confirmed managed config must be backed up"; ok=1; }
+  grep -qF "PRIOR-MANAGED" "${backups[0]}" 2>/dev/null ||
+    { fail "backup must contain the original managed content"; ok=1; }
+  return "$ok"
+}
+
+test_check_existing_config_unmanaged_confirmed_uppercase_Y_backs_up() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf 'some unmanaged content\n' >"$OCSERV_CONF"
+  stdin_is_terminal() { return 0; }
+  read_config_replacement_answer() { CONFIG_REPLACEMENT_ANSWER="Y"; }
+  local ok=0
+  assert_success check_existing_config || ok=1
+  assert_eq "1" "$CONFIG_REPLACEMENT_CONFIRMED" \
+    "uppercase Y confirmation must set CONFIG_REPLACEMENT_CONFIRMED=1" || ok=1
+  local backups
+  backups=("${OCSERV_CONF}".pre-vpn-node-*.bak)
+  [[ -f "${backups[0]}" ]] ||
+    { fail "confirmed unmanaged config must be backed up"; ok=1; }
+  grep -qF "some unmanaged content" "${backups[0]}" 2>/dev/null ||
+    { fail "backup must contain the original unmanaged content"; ok=1; }
+  return "$ok"
+}
+
+test_check_existing_config_declined_fails_without_backup() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  local answer
+  for answer in "n" "no thanks"; do
+    install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+    printf 'unchanged content\n' >"$OCSERV_CONF"
+    stdin_is_terminal() { return 0; }
+    read_config_replacement_answer() { CONFIG_REPLACEMENT_ANSWER="$answer"; }
+    local ok=0
+    # assert_failure runs check_existing_config in a subshell, so
+    # CONFIG_REPLACEMENT_CONFIRMED changes inside it are not observable
+    # here; the exit code and untouched filesystem state are what matter.
+    assert_failure check_existing_config || ok=1
+    _no_backups_exist ||
+      { fail "declined answer '$answer' must not create a backup"; ok=1; }
+    grep -qFx "unchanged content" "$OCSERV_CONF" ||
+      { fail "declined answer '$answer' must leave original config untouched"; ok=1; }
+    ((ok == 0)) || return 1
+    rm -f -- "$OCSERV_CONF"
+  done
+}
+
+test_check_existing_config_read_failure_fails_without_backup() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf 'unchanged content\n' >"$OCSERV_CONF"
+  stdin_is_terminal() { return 0; }
+  read_config_replacement_answer() { return 1; }
+  local ok=0
+  assert_failure check_existing_config || ok=1
+  _no_backups_exist ||
+    { fail "a read failure (EOF) must not create a backup"; ok=1; }
+  return "$ok"
+}
+
+test_check_existing_config_non_tty_fails_even_with_y_piped() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf 'unchanged content\n' >"$OCSERV_CONF"
+  # Deliberately do NOT override stdin_is_terminal: production has no
+  # environment/CLI bypass, so piping "y" into a non-terminal stdin must
+  # still be refused before read_config_replacement_answer is ever reached.
+  local rc=0
+  ( printf 'y\n' | check_existing_config ) >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "non-TTY stdin must fail even when y is piped"; ok=1; }
+  _no_backups_exist ||
+    { fail "non-TTY refusal must not create a backup"; ok=1; }
+  return "$ok"
+}
+
+test_next_config_backup_path_same_second_collision_uses_numbered_suffix() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf 'irrelevant\n' >"$OCSERV_CONF"
+  # Freeze "date" so three back-to-back calls collide on the same
+  # timestamp, forcing the numbered-suffix collision path deterministically.
+  cat >"$TEST_ROOT/bin/date" <<'MOCK_EOF'
+#!/usr/bin/env bash
+echo "20260101T000000Z"
+MOCK_EOF
+  chmod +x "$TEST_ROOT/bin/date"
+  local ok=0 first second third
+  first="$(PATH="$TEST_ROOT/bin:$PATH" next_config_backup_path)"
+  [[ "$first" == *".bak" && "$first" != *".1.bak" ]] ||
+    { fail "first candidate must be the plain .bak path (got $first)"; ok=1; }
+  : >"$first"
+  second="$(PATH="$TEST_ROOT/bin:$PATH" next_config_backup_path)"
+  [[ "$second" == *".1.bak" ]] ||
+    { fail "second candidate must be suffixed .1.bak once .bak exists (got $second)"; ok=1; }
+  : >"$second"
+  third="$(PATH="$TEST_ROOT/bin:$PATH" next_config_backup_path)"
+  [[ "$third" == *".2.bak" ]] ||
+    { fail "third candidate must be suffixed .2.bak once .1.bak exists (got $third)"; ok=1; }
+  return "$ok"
+}
+
+test_check_existing_config_backup_preserves_content_mode_mtime() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf 'exact original bytes\n' >"$OCSERV_CONF"
+  chmod 0640 "$OCSERV_CONF"
+  touch -d "2020-01-02 03:04:05 UTC" "$OCSERV_CONF"
+  local orig_mode orig_mtime
+  orig_mode="$(stat -c '%a' "$OCSERV_CONF")"
+  orig_mtime="$(stat -c '%Y' "$OCSERV_CONF")"
+  stdin_is_terminal() { return 0; }
+  read_config_replacement_answer() { CONFIG_REPLACEMENT_ANSWER="y"; }
   assert_success check_existing_config
+  local ok=0 backups backup
+  backups=("${OCSERV_CONF}".pre-vpn-node-*.bak)
+  backup="${backups[0]}"
+  [[ -f "$backup" ]] || { fail "backup file must exist"; return 1; }
+  assert_eq "exact original bytes" "$(cat "$backup")" "backup content" || ok=1
+  assert_eq "$orig_mode" "$(stat -c '%a' "$backup")" "backup mode" || ok=1
+  assert_eq "$orig_mtime" "$(stat -c '%Y' "$backup")" "backup mtime" || ok=1
+  return "$ok"
+}
+
+test_check_existing_config_backup_copy_failure_leaves_original_untouched() {
+  new_fixture
+  trap remove_fixture EXIT
+  source_deployer
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf 'must survive a failed backup attempt\n' >"$OCSERV_CONF"
+  chmod 0644 "$OCSERV_CONF"
+  cat >"$TEST_ROOT/bin/cp" <<'MOCK_EOF'
+#!/usr/bin/env bash
+exit 1
+MOCK_EOF
+  chmod +x "$TEST_ROOT/bin/cp"
+  stdin_is_terminal() { return 0; }
+  read_config_replacement_answer() { CONFIG_REPLACEMENT_ANSWER="y"; }
+  local rc=0
+  ( PATH="$TEST_ROOT/bin:$PATH" check_existing_config ) >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "a backup copy failure must fail the check"; ok=1; }
+  grep -qFx "must survive a failed backup attempt" "$OCSERV_CONF" ||
+    { fail "the original config must be left untouched when backup fails"; ok=1; }
+  _no_backups_exist ||
+    { fail "a failed cp must not leave a partial backup file"; ok=1; }
+  return "$ok"
 }
 
 # ---------- check_port_available ----------
@@ -1148,7 +1321,7 @@ test_check_port_available_other_process_fails() {
   assert_failure check_port_available
 }
 
-test_check_port_available_managed_rerun_allows_ocserv() {
+test_check_port_available_confirmed_rerun_allows_ocserv() {
   new_fixture
   listener_pid=""
   trap 'kill "$listener_pid" 2>/dev/null; remove_fixture' EXIT
@@ -1158,13 +1331,60 @@ test_check_port_available_managed_rerun_allows_ocserv() {
   OCSERV_PORT="$port"
   install -d -m 0755 "$(dirname "$OCSERV_CONF")"
   printf '%s\ntcp-port = %s\nudp-port = %s\n' "$MANAGED_MARKER" "$port" "$port" >"$OCSERV_CONF"
+  CONFIG_REPLACEMENT_CONFIRMED=1
   _write_mock_ocserv_listener_binary
   listener_pid="$(_start_test_listener "$TEST_ROOT/bin/ocserv" "$port")"
   sleep 0.5
   assert_success check_port_available
 }
 
-test_check_port_available_managed_rerun_port_change_conflict_fails() {
+# Regression test for the API change in this task: _configured_ocserv_port
+# used to allow a same-port ocserv rerun for any file containing
+# MANAGED_MARKER, with no confirmation step at all. It now additionally
+# requires CONFIG_REPLACEMENT_CONFIRMED==1, so an otherwise-identical
+# managed config that was never confirmed via check_existing_config must
+# still be rejected as a plain port conflict.
+test_check_port_available_unconfirmed_existing_config_with_ocserv_listener_fails() {
+  new_fixture
+  listener_pid=""
+  trap 'kill "$listener_pid" 2>/dev/null; remove_fixture' EXIT
+  source_deployer
+  local port
+  port="$(_free_tcp_port)"
+  OCSERV_PORT="$port"
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf '%s\ntcp-port = %s\nudp-port = %s\n' "$MANAGED_MARKER" "$port" "$port" >"$OCSERV_CONF"
+  # CONFIG_REPLACEMENT_CONFIRMED deliberately left at its default (0):
+  # check_existing_config was never called in this test.
+  _write_mock_ocserv_listener_binary
+  listener_pid="$(_start_test_listener "$TEST_ROOT/bin/ocserv" "$port")"
+  sleep 0.5
+  assert_failure check_port_available
+}
+
+# End-to-end wiring test: a real check_existing_config confirmation (not a
+# manually poked flag) must be what unlocks the same-port ocserv rerun
+# allowance, for an existing config that isn't even managed.
+test_check_existing_config_confirmation_unlocks_port_rerun() {
+  new_fixture
+  listener_pid=""
+  trap 'kill "$listener_pid" 2>/dev/null; remove_fixture' EXIT
+  source_deployer
+  local port
+  port="$(_free_tcp_port)"
+  OCSERV_PORT="$port"
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf 'unmanaged prior config\ntcp-port = %s\nudp-port = %s\n' "$port" "$port" >"$OCSERV_CONF"
+  stdin_is_terminal() { return 0; }
+  read_config_replacement_answer() { CONFIG_REPLACEMENT_ANSWER="y"; }
+  assert_success check_existing_config
+  _write_mock_ocserv_listener_binary
+  listener_pid="$(_start_test_listener "$TEST_ROOT/bin/ocserv" "$port")"
+  sleep 0.5
+  assert_success check_port_available
+}
+
+test_check_port_available_confirmed_rerun_port_change_conflict_fails() {
   new_fixture
   listener_pid=""
   trap 'kill "$listener_pid" 2>/dev/null; remove_fixture' EXIT
@@ -1178,12 +1398,13 @@ test_check_port_available_managed_rerun_port_change_conflict_fails() {
   OCSERV_PORT="$new_port"
   install -d -m 0755 "$(dirname "$OCSERV_CONF")"
   printf '%s\ntcp-port = %s\nudp-port = %s\n' "$MANAGED_MARKER" "$old_port" "$old_port" >"$OCSERV_CONF"
+  CONFIG_REPLACEMENT_CONFIRMED=1
   listener_pid="$(_start_test_listener "$(command -v python3)" "$new_port")"
   sleep 0.5
   assert_failure check_port_available
 }
 
-test_check_port_available_managed_rerun_same_port_non_ocserv_owner_fails() {
+test_check_port_available_confirmed_rerun_same_port_non_ocserv_owner_fails() {
   new_fixture
   listener_pid=""
   trap 'kill "$listener_pid" 2>/dev/null; remove_fixture' EXIT
@@ -1193,8 +1414,9 @@ test_check_port_available_managed_rerun_same_port_non_ocserv_owner_fails() {
   OCSERV_PORT="$port"
   install -d -m 0755 "$(dirname "$OCSERV_CONF")"
   printf '%s\ntcp-port = %s\nudp-port = %s\n' "$MANAGED_MARKER" "$port" "$port" >"$OCSERV_CONF"
+  CONFIG_REPLACEMENT_CONFIRMED=1
   # Listener is plain python3 (not ocserv) on the same configured port.
-  # The ownership check must reject it even on a managed rerun.
+  # The ownership check must reject it even on a confirmed rerun.
   listener_pid="$(_start_test_listener "$(command -v python3)" "$OCSERV_PORT")"
   sleep 0.5
   assert_failure check_port_available
@@ -1361,14 +1583,22 @@ run_test "render config certificate paths" test_render_ocserv_config_certs
 run_test "render config network/mask" test_render_ocserv_config_network
 run_test "render config multiple DNS directives" test_render_ocserv_config_dns_multiple
 run_test "render config route default, no compression" test_render_ocserv_config_route_and_no_compression
-run_test "unknown existing config backed up and fails" test_check_existing_config_unknown_backed_up_and_fails
-run_test "managed existing config accepted" test_check_existing_config_managed_accepted
-run_test "absent existing config passes" test_check_existing_config_absent_passes
+run_test "absent existing config passes and resets stale confirmation" test_check_existing_config_absent_passes
+run_test "managed existing config + lowercase y backs up and succeeds" test_check_existing_config_managed_confirmed_lowercase_y_backs_up
+run_test "unmanaged existing config + uppercase Y backs up and succeeds" test_check_existing_config_unmanaged_confirmed_uppercase_Y_backs_up
+run_test "declined confirmation (n/other text) fails without backup" test_check_existing_config_declined_fails_without_backup
+run_test "EOF/read failure fails without backup" test_check_existing_config_read_failure_fails_without_backup
+run_test "non-TTY stdin fails even when y is piped" test_check_existing_config_non_tty_fails_even_with_y_piped
+run_test "same-second backup collisions use numbered suffixes" test_next_config_backup_path_same_second_collision_uses_numbered_suffix
+run_test "backup preserves content, mode, and mtime" test_check_existing_config_backup_preserves_content_mode_mtime
+run_test "backup copy failure fails and leaves original untouched" test_check_existing_config_backup_copy_failure_leaves_original_untouched
 run_test "free port passes" test_check_port_available_free_port_passes
 run_test "port owned by other process fails" test_check_port_available_other_process_fails
-run_test "managed rerun allows ocserv listener on same port" test_check_port_available_managed_rerun_allows_ocserv
-run_test "managed rerun port change conflict fails" test_check_port_available_managed_rerun_port_change_conflict_fails
-run_test "managed rerun same port non-ocserv owner fails" test_check_port_available_managed_rerun_same_port_non_ocserv_owner_fails
+run_test "confirmed rerun allows ocserv listener on same port" test_check_port_available_confirmed_rerun_allows_ocserv
+run_test "unconfirmed existing config with ocserv listener still fails" test_check_port_available_unconfirmed_existing_config_with_ocserv_listener_fails
+run_test "check_existing_config confirmation unlocks port rerun" test_check_existing_config_confirmation_unlocks_port_rerun
+run_test "confirmed rerun port change conflict fails" test_check_port_available_confirmed_rerun_port_change_conflict_fails
+run_test "confirmed rerun same port non-ocserv owner fails" test_check_port_available_confirmed_rerun_same_port_non_ocserv_owner_fails
 run_test "route overlap conflict fails" test_check_route_overlap_conflict_fails
 run_test "route overlap unrelated route passes" test_check_route_overlap_unrelated_passes
 run_test "route overlap skips ECMP nexthop lines" test_check_route_overlap_skips_ecmp_nexthop_lines
@@ -2003,6 +2233,13 @@ ${extra}
   _write_orch_mocks
   mkdir -p "$TEST_ROOT/ctl"
   export PATH="$TEST_ROOT/bin:$PATH"
+  # Interactive approval seams: preserves every existing orchestration test
+  # unmodified (no confirmation bytes ahead of initial-user stdin input),
+  # while letting tests that DO seed an existing config exercise the
+  # confirmed-replacement path. Tests probing decline/non-TTY behavior
+  # redefine these two functions again after calling this fixture.
+  stdin_is_terminal() { return 0; }
+  read_config_replacement_answer() { CONFIG_REPLACEMENT_ANSWER="y"; }
 }
 
 _seed_prior_managed_files() {
@@ -2543,6 +2780,132 @@ test_install_refuses_unmanaged_hook_in_letsencrypt_mode() {
   return "$ok"
 }
 
+# ---------- interactive config replacement confirmation (main install) ----
+
+test_main_install_terminal_refusal_does_not_call_apt() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf 'EXISTING-CONF\n' >"$OCSERV_CONF"
+  # Override the fixture default: simulate an interactive terminal that
+  # declines the replacement.
+  stdin_is_terminal() { return 0; }
+  read_config_replacement_answer() { CONFIG_REPLACEMENT_ANSWER="n"; }
+  local rc=0
+  ( main install ) </dev/null >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "install must fail when replacement is declined"; ok=1; }
+  [[ ! -f "$TEST_ROOT/apt-get-args.log" ]] ||
+    { fail "apt-get must not run when confirmation is declined"; ok=1; }
+  grep -qFx 'EXISTING-CONF' "$OCSERV_CONF" 2>/dev/null ||
+    { fail "the existing config must be left untouched when declined"; ok=1; }
+  return "$ok"
+}
+
+test_main_install_non_tty_existing_config_does_not_call_apt() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf 'EXISTING-CONF\n' >"$OCSERV_CONF"
+  # Override the fixture default: force the non-terminal-stdin path.
+  stdin_is_terminal() { return 1; }
+  local rc=0
+  ( main install ) </dev/null >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "install must fail on non-TTY stdin with an existing config"; ok=1; }
+  [[ ! -f "$TEST_ROOT/apt-get-args.log" ]] ||
+    { fail "apt-get must not run on a non-TTY refusal"; ok=1; }
+  grep -qFx 'EXISTING-CONF' "$OCSERV_CONF" 2>/dev/null ||
+    { fail "the existing config must be left untouched on a non-TTY refusal"; ok=1; }
+  return "$ok"
+}
+
+test_main_install_confirmed_restart_failure_restores_original_and_keeps_backup() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  _seed_prior_managed_files
+  touch "$TEST_ROOT/ctl/restart_fail"
+  local rc=0
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) || { fail "install must fail when restart fails"; ok=1; }
+  grep -qFx 'PRIOR-CONF' "$OCSERV_CONF" 2>/dev/null ||
+    { fail "the transactional rollback must restore the pre-install config"; ok=1; }
+  local backups
+  backups=("${OCSERV_CONF}".pre-vpn-node-*.bak)
+  [[ -f "${backups[0]}" ]] ||
+    { fail "the permanent confirmation backup must survive the rollback"; ok=1; }
+  grep -qF "PRIOR-CONF" "${backups[0]}" 2>/dev/null ||
+    { fail "the permanent backup must contain the pre-install content"; ok=1; }
+  return "$ok"
+}
+
+# ---------- unmanaged helper/drop-in/hook still refused after confirmation --
+
+test_install_refuses_unmanaged_helper_after_config_confirmation() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf 'EXISTING-CONF\n' >"$OCSERV_CONF"
+  install -d -m 0755 "$(dirname "$NETWORK_HELPER")"
+  printf 'UNMANAGED-HELPER\n' >"$NETWORK_HELPER"
+  chmod 0755 "$NETWORK_HELPER"
+  local rc=0
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) ||
+    { fail "install must refuse an unmanaged network helper even after config confirmation"; ok=1; }
+  grep -qFx 'UNMANAGED-HELPER' "$NETWORK_HELPER" 2>/dev/null ||
+    { fail "the unmanaged network helper must be left untouched"; ok=1; }
+  return "$ok"
+}
+
+test_install_refuses_unmanaged_dropin_after_config_confirmation() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture selfsigned
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf 'EXISTING-CONF\n' >"$OCSERV_CONF"
+  install -d -m 0755 "$(dirname "$SYSTEMD_DROPIN")"
+  printf 'UNMANAGED-DROPIN\n' >"$SYSTEMD_DROPIN"
+  chmod 0644 "$SYSTEMD_DROPIN"
+  local rc=0
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) ||
+    { fail "install must refuse an unmanaged systemd drop-in even after config confirmation"; ok=1; }
+  grep -qFx 'UNMANAGED-DROPIN' "$SYSTEMD_DROPIN" 2>/dev/null ||
+    { fail "the unmanaged systemd drop-in must be left untouched"; ok=1; }
+  return "$ok"
+}
+
+test_install_refuses_unmanaged_hook_after_config_confirmation() {
+  new_fixture
+  trap 'rm -rf -- "$TEST_ROOT"' EXIT
+  _orchestration_fixture letsencrypt \
+    "$(printf 'CERT_NAME="vpn.example.com"\nLE_CONFIG_DIR="%s/etc/letsencrypt"' "$OCSERV_DEPLOY_ROOT")"
+  local live="$OCSERV_DEPLOY_ROOT/etc/letsencrypt/live/vpn.example.com"
+  install -d -m 0755 "$live"
+  _generate_test_cert vpn.example.com "$live/fullchain.pem" "$live/privkey.pem"
+  install -d -m 0755 "$(dirname "$OCSERV_CONF")"
+  printf 'EXISTING-CONF\n' >"$OCSERV_CONF"
+  install -d -m 0755 "$(dirname "$CERT_HOOK")"
+  printf 'UNMANAGED-HOOK\n' >"$CERT_HOOK"
+  chmod +x "$CERT_HOOK"
+  local rc=0
+  ( main install ) < <(printf 'vpnuser\nsecretpass\nsecretpass\n') >/dev/null 2>&1 || rc=$?
+  local ok=0
+  ((rc != 0)) ||
+    { fail "letsencrypt install must refuse an unmanaged hook even after config confirmation"; ok=1; }
+  grep -qFx 'UNMANAGED-HOOK' "$CERT_HOOK" 2>/dev/null ||
+    { fail "the unmanaged hook must be left untouched"; ok=1; }
+  return "$ok"
+}
+
 run_test "dependencies are the exact package set" test_install_dependencies_installs_exact_packages
 run_test "install dependencies uses apt directly" test_install_dependencies_uses_apt_directly
 run_test "install lock rejects concurrent runs" test_install_lock_rejects_concurrent_runs
@@ -2574,5 +2937,11 @@ run_test "selfsigned leaves unmanaged hook" test_selfsigned_leaves_unmanaged_hoo
 run_test "install refuses unmanaged helper" test_install_refuses_unmanaged_helper
 run_test "install refuses unmanaged drop-in" test_install_refuses_unmanaged_dropin
 run_test "letsencrypt refuses unmanaged hook" test_install_refuses_unmanaged_hook_in_letsencrypt_mode
+run_test "install terminal refusal of existing config does not call apt" test_main_install_terminal_refusal_does_not_call_apt
+run_test "install non-TTY existing config does not call apt" test_main_install_non_tty_existing_config_does_not_call_apt
+run_test "confirmed config + restart failure restores original and keeps backup" test_main_install_confirmed_restart_failure_restores_original_and_keeps_backup
+run_test "install refuses unmanaged helper after config confirmation" test_install_refuses_unmanaged_helper_after_config_confirmation
+run_test "install refuses unmanaged drop-in after config confirmation" test_install_refuses_unmanaged_dropin_after_config_confirmation
+run_test "letsencrypt refuses unmanaged hook after config confirmation" test_install_refuses_unmanaged_hook_after_config_confirmation
 
 finish_tests
