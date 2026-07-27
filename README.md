@@ -10,19 +10,19 @@ ocserv 和 nftables 的平台可能兼容，但未经过验证；脚本不会按
 
 | 文件 | 用途 |
 |---|---|
-| `vpn-maintenance.sh` | DDNS、初始证书签发和手动续签检查 |
-| `vpn-maintenance.env.example` | 配置模板 |
-| `vpn-ddns.service` | systemd DDNS oneshot service |
-| `vpn-ddns.timer` | systemd DDNS 定时器（每 5 分钟，开机后执行） |
-| `ocserv-deploy.sh` | ocserv（OpenConnect/AnyConnect）一键安装、用户管理 |
-| `tests/ocserv-deploy-test.sh` | `ocserv-deploy.sh` 的 Bash 测试套件 |
+| `server/vpn-maintenance.sh` | DDNS、初始证书签发和手动续签检查 |
+| `server/vpn-maintenance.env.example` | 配置模板 |
+| `server/vpn-ddns.service` | systemd DDNS oneshot service |
+| `server/vpn-ddns.timer` | systemd DDNS 定时器（每 5 分钟，开机后执行） |
+| `server/ocserv-deploy.sh` | ocserv（OpenConnect/AnyConnect）一键安装、用户管理 |
+| `tests/server/ocserv-deploy-test.sh` | `server/ocserv-deploy.sh` 的 Bash 测试套件 |
 
 ## 准备
 
 ```bash
-sudo install -m 0755 vpn-maintenance.sh /usr/local/sbin/vpn-maintenance.sh
-sudo install -m 0644 vpn-ddns.service vpn-ddns.timer /etc/systemd/system/
-sudo install -m 0600 vpn-maintenance.env.example /etc/vpn-maintenance.env
+sudo install -m 0755 server/vpn-maintenance.sh /usr/local/sbin/vpn-maintenance.sh
+sudo install -m 0644 server/vpn-ddns.service server/vpn-ddns.timer /etc/systemd/system/
+sudo install -m 0600 server/vpn-maintenance.env.example /etc/vpn-maintenance.env
 sudo -e /etc/vpn-maintenance.env
 ```
 
@@ -97,9 +97,9 @@ OCSERV_CERT_MODE="letsencrypt"
 ```
 
 ```bash
-sudo ./ocserv-deploy.sh install
-sudo ./ocserv-deploy.sh add-user USERNAME
-sudo ./ocserv-deploy.sh del-user USERNAME
+sudo ./server/ocserv-deploy.sh install
+sudo ./server/ocserv-deploy.sh add-user USERNAME
+sudo ./server/ocserv-deploy.sh del-user USERNAME
 ```
 
 若 `/etc/ocserv/ocserv.conf` 已存在，安装器会要求输入 y 确认，先备份原配置，
