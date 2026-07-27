@@ -47,6 +47,17 @@ source_deployer() {
   IMMORTALWRT_DEPLOY_SOURCE_ONLY=1 source "$SCRIPT_PATH"
 }
 
+# A real self-signed certificate, base64-encoded, mirrors exactly what the
+# server hands the client via HY2_CERT_PEM_B64 in its client env file.
+_gen_test_cert_b64() {
+  local d; d="$(mktemp -d)"
+  openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 2 \
+    -subj "/CN=hy2-test" -keyout "$d/k.pem" -out "$d/c.pem" >/dev/null 2>&1
+  base64 -w0 <"$d/c.pem"
+  rm -rf -- "$d"
+}
+HY2_TEST_CERT_B64="$(_gen_test_cert_b64)"
+
 VALID_CONFIG='
 LAN_ADDRESS="10.192.0.1/24"
 '
@@ -67,7 +78,7 @@ WG_GLOBAL_PEERS=(
 '
 
 # Full proxy parameters (as copied from the server client-params file), with a
-# self-signed HY2 trust anchor (a short fake PEM).
+# self-signed HY2 trust anchor delivered as base64-encoded PEM.
 PROXY_CONFIG='
 LAN_ADDRESS="10.192.0.1/24"
 VPS_IPV4="203.0.113.7"
@@ -75,15 +86,14 @@ HY2_PORT="443"
 HY2_PASSWORD="hy2pass"
 HY2_OBFS_PASSWORD="salampass"
 HY2_CERT_MODE="selfsigned"
-HY2_CERT_PIN="-----BEGIN CERTIFICATE-----
-FAKEHY2CERTIFICATEBODY
------END CERTIFICATE-----"
+HY2_CERT_PEM_B64="__HY2_CERT_B64__"
 REALITY_PORT="443"
 REALITY_UUID="11111111-2222-3333-4444-555555555555"
 REALITY_PUBLIC_KEY="REALITYPUBKEY0001"
 REALITY_SHORT_ID="0a1b2c3d"
 REALITY_TARGET_NAME="www.microsoft.com"
 '
+PROXY_CONFIG="${PROXY_CONFIG//__HY2_CERT_B64__/$HY2_TEST_CERT_B64}"
 
 # Proxy + optional Cloudflare AAAA DDNS.
 DDNS_CONFIG='
@@ -92,9 +102,7 @@ VPS_IPV4="203.0.113.7"
 HY2_PASSWORD="hy2pass"
 HY2_OBFS_PASSWORD="salampass"
 HY2_CERT_MODE="selfsigned"
-HY2_CERT_PIN="-----BEGIN CERTIFICATE-----
-FAKEHY2CERTIFICATEBODY
------END CERTIFICATE-----"
+HY2_CERT_PEM_B64="__HY2_CERT_B64__"
 REALITY_UUID="11111111-2222-3333-4444-555555555555"
 REALITY_PUBLIC_KEY="REALITYPUBKEY0001"
 REALITY_SHORT_ID="0a1b2c3d"
@@ -103,6 +111,7 @@ HOME_DOMAIN="home.example.com"
 CLOUDFLARE_ZONE_ID="zone123"
 CLOUDFLARE_API_TOKEN="token456"
 '
+DDNS_CONFIG="${DDNS_CONFIG//__HY2_CERT_B64__/$HY2_TEST_CERT_B64}"
 
 # Proxy + Let'\''s Encrypt for both HY2 (public CA) and public LuCI (DNS-01).
 LE_CONFIG='
@@ -1012,7 +1021,7 @@ test_rejects_proxy_without_password() {
   assert_failure validate_config
 }
 
-test_rejects_selfsigned_without_pin() {
+test_rejects_selfsigned_without_pem() {
   new_fixture
   trap remove_fixture EXIT
   write_config '
@@ -1028,6 +1037,64 @@ HY2_CERT_MODE="selfsigned"
   source_deployer
   load_config
   assert_failure validate_config
+}
+
+# Legacy HY2_CERT_PIN was a misleading name (it actually held a raw PEM). It is
+# now HY2_CERT_PEM_B64 (base64 PEM); a leftover HY2_CERT_PIN must fail loudly.
+test_rejects_legacy_hy2_cert_pin() {
+  new_fixture
+  trap remove_fixture EXIT
+  local cfg='
+VPS_IPV4="203.0.113.7"
+HY2_PASSWORD="p"
+HY2_OBFS_PASSWORD="o"
+REALITY_UUID="11111111-2222-3333-4444-555555555555"
+REALITY_PUBLIC_KEY="k"
+REALITY_SHORT_ID="s"
+REALITY_TARGET_NAME="www.microsoft.com"
+HY2_CERT_MODE="selfsigned"
+HY2_CERT_PEM_B64="__HY2_CERT_B64__"
+HY2_CERT_PIN="-----BEGIN CERTIFICATE-----
+LEGACY
+-----END CERTIFICATE-----"
+'
+  cfg="${cfg//__HY2_CERT_B64__/$HY2_TEST_CERT_B64}"
+  write_config "$cfg"
+  source_deployer
+  load_config
+  assert_failure validate_config
+}
+
+# A malformed base64 blob must be rejected rather than written as junk.
+test_rejects_selfsigned_bad_base64() {
+  new_fixture
+  trap remove_fixture EXIT
+  write_config '
+VPS_IPV4="203.0.113.7"
+HY2_PASSWORD="p"
+HY2_OBFS_PASSWORD="o"
+REALITY_UUID="11111111-2222-3333-4444-555555555555"
+REALITY_PUBLIC_KEY="k"
+REALITY_SHORT_ID="s"
+REALITY_TARGET_NAME="www.microsoft.com"
+HY2_CERT_MODE="selfsigned"
+HY2_CERT_PEM_B64="not*valid*base64*!!"
+'
+  source_deployer
+  load_config
+  assert_failure validate_config
+}
+
+# The base64 PEM must decode to /etc/homeproxy/certs/hy2-server.pem at mode 0644.
+test_hy2_ca_file_decoded_to_pem_0644() {
+  _prep "$PROXY_CONFIG"
+  trap remove_fixture EXIT
+  local dest="$TEST_ROOT/hy2-server.pem"
+  write_hy2_ca_file "$dest"
+  [[ -f "$dest" ]] || fail "trust anchor was not written"
+  assert_eq "644" "$(stat -c '%a' "$dest")" "trust anchor mode"
+  openssl x509 -in "$dest" -noout >/dev/null 2>&1 ||
+    fail "decoded trust anchor must be a valid certificate"
 }
 
 test_accepts_full_proxy_config() {
@@ -1130,7 +1197,7 @@ test_homeproxy_hy2_node_selfsigned() {
   _grep "set homeproxy.hp_hy2.tls_insecure='0'" "$out"
   _grep "set homeproxy.hp_hy2.tls_self_sign='1'" "$out"
   _grep "set homeproxy.hp_hy2.tls_cert_path=" "$out"
-  _grep "/etc/homeproxy/certs/hy2_server_ca.pem" "$out"
+  _grep "/etc/homeproxy/certs/hy2-server.pem" "$out"
   # Never fall back to insecure TLS.
   _ngrep "set homeproxy.hp_hy2.tls_insecure='1'" "$out"
 }
@@ -1180,7 +1247,7 @@ test_homeproxy_main_node_switchable() {
 }
 
 test_homeproxy_hopping_ports() {
-  _prep '
+  local cfg='
 LAN_ADDRESS="10.192.0.1/24"
 VPS_IPV4="203.0.113.7"
 HY2_PORT="443"
@@ -1188,14 +1255,14 @@ HY2_PORTS="20000:30000"
 HY2_PASSWORD="hy2pass"
 HY2_OBFS_PASSWORD="salampass"
 HY2_CERT_MODE="selfsigned"
-HY2_CERT_PIN="-----BEGIN CERTIFICATE-----
-X
------END CERTIFICATE-----"
+HY2_CERT_PEM_B64="__HY2_CERT_B64__"
 REALITY_UUID="11111111-2222-3333-4444-555555555555"
 REALITY_PUBLIC_KEY="k"
 REALITY_SHORT_ID="s"
 REALITY_TARGET_NAME="www.microsoft.com"
 '
+  cfg="${cfg//__HY2_CERT_B64__/$HY2_TEST_CERT_B64}"
+  _prep "$cfg"
   trap remove_fixture EXIT
   local out="$TEST_ROOT/hp.uci"
   : >"$out"
@@ -1471,7 +1538,10 @@ run_test "rejects bad HY2_CERT_MODE" test_rejects_bad_hy2_cert_mode
 run_test "rejects bad LUCI_CERT_MODE" test_rejects_bad_luci_cert_mode
 run_test "rejects bad LUCI_PUBLIC_PORT" test_rejects_bad_luci_port
 run_test "rejects proxy without password" test_rejects_proxy_without_password
-run_test "rejects selfsigned without pin" test_rejects_selfsigned_without_pin
+run_test "rejects selfsigned without pem" test_rejects_selfsigned_without_pem
+run_test "rejects legacy HY2_CERT_PIN" test_rejects_legacy_hy2_cert_pin
+run_test "rejects selfsigned bad base64" test_rejects_selfsigned_bad_base64
+run_test "hy2 trust anchor decoded to pem 0644" test_hy2_ca_file_decoded_to_pem_0644
 run_test "accepts full proxy config" test_accepts_full_proxy_config
 run_test "rejects home domain without token" test_rejects_home_domain_without_token
 run_test "rejects LE LuCI without domain" test_rejects_le_luci_without_domain

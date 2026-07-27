@@ -396,6 +396,11 @@ test_selfsigned_generates_ip_san_and_pin() {
     grep -q 'IP Address:104.46.217.92' ||
     fail "self-signed certificate is missing the IP SAN"
   [[ -n "$HY2_PIN_SHA256" ]] || fail "self-signed pin was not computed"
+  [[ -n "$HY2_CERT_PEM_B64" ]] ||
+    fail "self-signed certificate was not base64-encoded for the client"
+  printf '%s' "$HY2_CERT_PEM_B64" | base64 -d |
+    openssl x509 -noout >/dev/null 2>&1 ||
+    fail "HY2_CERT_PEM_B64 must decode to a valid certificate"
 }
 
 test_selfsigned_reuses_existing_pair() {
@@ -880,6 +885,55 @@ test_show_client_missing_fails() {
   assert_failure cmd_show_client
 }
 
+# ==================== Client env self-signed certificate handoff ====================
+
+# The default (self-signed) mode must hand the client the full server
+# certificate, base64-encoded, so the client can trust it without insecure TLS.
+test_client_file_embeds_selfsigned_cert_b64() {
+  new_fixture
+  trap remove_fixture EXIT
+  _orchestration_fixture
+  resolve_secrets
+  ( install_server ) </dev/null >/dev/null 2>&1 || fail "install_server failed"
+  [[ -f "$CLIENT_FILE" ]] || fail "client file not installed"
+  grep -q '^HY2_CERT_PEM_B64=' "$CLIENT_FILE" ||
+    fail "client file must embed HY2_CERT_PEM_B64"
+  local b64 decoded
+  b64="$(set +u; source "$CLIENT_FILE"; printf '%s' "$HY2_CERT_PEM_B64")"
+  [[ -n "$b64" ]] || fail "HY2_CERT_PEM_B64 must be non-empty in selfsigned mode"
+  decoded="$(printf '%s' "$b64" | base64 -d)" ||
+    fail "HY2_CERT_PEM_B64 must be valid base64"
+  printf '%s' "$decoded" | openssl x509 -noout >/dev/null 2>&1 ||
+    fail "decoded HY2_CERT_PEM_B64 must be a valid certificate"
+  assert_eq "$(cat "$SELF_SIGNED_CERT")" "$decoded" \
+    "embedded certificate must equal the installed self-signed certificate"
+}
+
+# Let's Encrypt mode uses a public CA, so no certificate PEM is handed over.
+test_client_file_letsencrypt_omits_cert_b64() {
+  new_fixture
+  trap remove_fixture EXIT
+  _make_ip_cert "104.46.217.92" "$TEST_ROOT/le/fullchain.pem" "$TEST_ROOT/le/privkey.pem"
+  write_config "
+SERVER_IPV4=\"104.46.217.92\"
+HY2_CERT_MODE=\"letsencrypt\"
+HY2_CERT_FILE=\"$TEST_ROOT/le/fullchain.pem\"
+HY2_KEY_FILE=\"$TEST_ROOT/le/privkey.pem\"
+REALITY_TARGET=\"www.microsoft.com\"
+"
+  source_deployer
+  load_config
+  validate_config
+  _write_mocks
+  export PATH="$TEST_ROOT/bin:$PATH"
+  resolve_secrets
+  prepare_certificate
+  local out="$TEST_ROOT/client.env"
+  render_client_file "$out"
+  grep -q "^HY2_CERT_PEM_B64=''" "$out" ||
+    fail "letsencrypt client file must carry an empty HY2_CERT_PEM_B64"
+}
+
 # ==================== Runner ====================
 
 run_test "valid config passes" test_valid_config_passes
@@ -940,5 +994,8 @@ run_test "no optional-script invocation at runtime" test_no_optional_script_invo
 
 run_test "show-client prints parameters" test_show_client_prints_parameters
 run_test "show-client missing fails" test_show_client_missing_fails
+
+run_test "client file embeds selfsigned cert b64" test_client_file_embeds_selfsigned_cert_b64
+run_test "client file letsencrypt omits cert b64" test_client_file_letsencrypt_omits_cert_b64
 
 finish_tests

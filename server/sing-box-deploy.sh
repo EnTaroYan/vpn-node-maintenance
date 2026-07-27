@@ -57,6 +57,7 @@ SERVER_CERT_FILE=""
 SERVER_KEY_FILE=""
 HY2_PORTS_RANGE=""
 HY2_PIN_SHA256=""
+HY2_CERT_PEM_B64=""
 
 log() {
   printf '%s [sing-box-deploy] %s\n' "$(date --iso-8601=seconds)" "$*"
@@ -265,6 +266,9 @@ render_client_file() {
     printf 'HY2_CERT_MODE=%q\n' "$HY2_CERT_MODE"
     printf 'HY2_SNI=%q\n' "${HY2_SNI:-$SERVER_IPV4}"
     printf 'HY2_PIN_SHA256=%q\n' "$HY2_PIN_SHA256"
+    # Full server certificate (base64-encoded PEM) so the client can trust the
+    # self-signed identity directly. Empty for letsencrypt (public CA) mode.
+    printf 'HY2_CERT_PEM_B64=%q\n' "$HY2_CERT_PEM_B64"
     printf 'REALITY_PORT=%q\n' "$REALITY_PORT"
     printf 'VLESS_UUID=%q\n' "$VLESS_UUID"
     printf 'REALITY_PUBLIC_KEY=%q\n' "$REALITY_PUBLIC_KEY"
@@ -355,6 +359,7 @@ prepare_selfsigned_certificate() {
   SERVER_CERT_FILE="$SELF_SIGNED_CERT"
   SERVER_KEY_FILE="$SELF_SIGNED_KEY"
   HY2_PIN_SHA256="$(compute_cert_pin "$SERVER_CERT_FILE")"
+  HY2_CERT_PEM_B64="$(base64 -w0 <"$SERVER_CERT_FILE")"
 }
 
 prepare_letsencrypt_certificate() {
@@ -367,6 +372,7 @@ prepare_letsencrypt_certificate() {
   SERVER_CERT_FILE="$HY2_CERT_FILE"
   SERVER_KEY_FILE="$HY2_KEY_FILE"
   HY2_PIN_SHA256=""
+  HY2_CERT_PEM_B64=""
 }
 
 prepare_certificate() {
@@ -828,6 +834,7 @@ print_install_summary() {
   printf 'Certificate mode: %s\n' "$HY2_CERT_MODE"
   if [[ "$HY2_CERT_MODE" == "selfsigned" ]]; then
     printf 'HY2 pin-sha256: %s (client must not use insecure=true)\n' "$HY2_PIN_SHA256"
+    printf 'HY2 self-signed certificate embedded in client env as HY2_CERT_PEM_B64.\n'
   fi
   printf 'Azure NSG: allow UDP %s' "$HY2_PORT"
   [[ -n "$HY2_PORTS_RANGE" ]] && printf ' and UDP %s' "$HY2_PORTS_RANGE"

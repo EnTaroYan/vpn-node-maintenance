@@ -129,5 +129,5 @@ sudo nft list table ip vpn_node_ocserv
 
 - Cloudflare 记录须保持 DNS-only（灰云）。
 - Token、env 文件、私钥、密码文件须为 root-only，不得提交到 Git。
-- `selfsigned` 模式下客户端须使用安装完成时打印的 `pin-sha256` 指纹连接。
+- `selfsigned` 模式下服务端将完整自签证书以 `HY2_CERT_PEM_B64`（base64 PEM）写入客户端 env，客户端解码到 `/etc/homeproxy/certs/hy2-server.pem` 并信任；同时打印 `pin-sha256` 供核对。
 - DDNS 和证书成功不等于 Azure 入站端口已放行。

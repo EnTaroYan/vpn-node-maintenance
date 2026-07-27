@@ -30,7 +30,7 @@ readonly TRANSACTION_DIR_ROOT="${ROOT_PREFIX}/run/immortalwrt-deploy"
 # HomeProxy self-signed trust anchor for the Hysteria2 node (PEM). Lives under
 # /etc/homeproxy/certs so it is inside the ujail mount sing-box runs under.
 readonly HOMEPROXY_CERT_DIR="${ROOT_PREFIX}/etc/homeproxy/certs"
-readonly HY2_CA_FILE="${HOMEPROXY_CERT_DIR}/hy2_server_ca.pem"
+readonly HY2_CA_FILE="${HOMEPROXY_CERT_DIR}/hy2-server.pem"
 
 # Public LuCI (separate uhttpd instance) self-signed certificate material.
 readonly LUCI_PUBLIC_CRT="${VPN_NODE_DIR}/luci-public.crt"
@@ -168,6 +168,9 @@ apply_defaults() {
   HY2_OBFS_PASSWORD="${HY2_OBFS_PASSWORD:-}"
   HY2_SNI="${HY2_SNI:-}"
   HY2_CERT_MODE="${HY2_CERT_MODE:-selfsigned}"
+  # Server self-signed certificate as base64-encoded PEM (from the server's
+  # client env). HY2_CERT_PIN is the retired name kept only to fail loudly.
+  HY2_CERT_PEM_B64="${HY2_CERT_PEM_B64:-}"
   HY2_CERT_PIN="${HY2_CERT_PIN:-}"
   REALITY_PORT="${REALITY_PORT:-443}"
   REALITY_UUID="${REALITY_UUID:-}"
@@ -339,8 +342,12 @@ validate_proxy_config() {
   valid_hostname "$REALITY_TARGET_NAME" ||
     die "REALITY_TARGET_NAME must be a valid domain name"
   if [[ "$HY2_CERT_MODE" == "selfsigned" ]]; then
-    [[ -n "$HY2_CERT_PIN" ]] ||
-      die "HY2_CERT_PIN (server self-signed certificate PEM) is required for selfsigned HY2_CERT_MODE"
+    [[ -z "$HY2_CERT_PIN" ]] ||
+      die "HY2_CERT_PIN has been renamed to HY2_CERT_PEM_B64; set the base64-encoded server certificate PEM there instead"
+    [[ -n "$HY2_CERT_PEM_B64" ]] ||
+      die "HY2_CERT_PEM_B64 (base64-encoded server self-signed certificate PEM) is required for selfsigned HY2_CERT_MODE"
+    decode_hy2_cert_pem >/dev/null ||
+      die "HY2_CERT_PEM_B64 must be base64-encoded PEM of the server certificate"
   fi
 }
 
@@ -984,13 +991,24 @@ validate_peer_templates() {
 
 # ==================== Certificate and DDNS artifacts ====================
 
-# HY2 self-signed trust anchor: HY2_CERT_PIN carries the server's self-signed
-# certificate (PEM). HomeProxy trusts it via tls_self_sign + tls_cert_path, so
-# the client never resorts to insecure TLS.
+# HY2 self-signed trust anchor: HY2_CERT_PEM_B64 carries the server's self-signed
+# certificate as base64-encoded PEM (produced by the server deployer). Decode it
+# and confirm it is a real certificate; callers write it to tls_cert_path so
+# HomeProxy trusts it via tls_self_sign and never resorts to insecure TLS.
+decode_hy2_cert_pem() {
+  local pem
+  pem="$(printf '%s' "$HY2_CERT_PEM_B64" | base64 -d 2>/dev/null)" || return 1
+  [[ "$pem" == *"-----BEGIN CERTIFICATE-----"* ]] || return 1
+  printf '%s' "$pem" | openssl x509 -noout >/dev/null 2>&1 || return 1
+  printf '%s\n' "$pem"
+}
+
 write_hy2_ca_file() {
-  local dest="$1"
+  local dest="$1" pem
+  pem="$(decode_hy2_cert_pem)" ||
+    die "failed to decode HY2_CERT_PEM_B64 into a server certificate"
   install -d -m 0755 "$(dirname "$dest")"
-  printf '%s\n' "$HY2_CERT_PIN" >"$dest"
+  printf '%s\n' "$pem" >"$dest"
   chmod 0644 "$dest"
 }
 
