@@ -518,6 +518,11 @@ test_network_pppoe_and_dhcp_metrics() {
   _grep "set network.wan.metric='20'" "$out"
   _grep "set network.wanpppoe6.proto='dhcpv6'" "$out"
   _grep "set network.wanpppoe6.device='@wanpppoe'" "$out"
+  # IPv6 is handled solely by the dedicated wanpppoe6 dhcpv6 interface, so the
+  # PPPoE interface's own auto IPv6 sub-interface must be disabled (no
+  # redundant/conflicting second IPv6 client on the same link).
+  _grep "set network.wanpppoe.ipv6='0'" "$out"
+  _ngrep "set network.wanpppoe.ipv6='auto'" "$out"
   # PPPoE metric must be lower (preferred) than the DHCP fallback metric.
   ((10#$PPPOE_METRIC < 10#$DHCP_METRIC)) ||
     fail "pppoe metric must be lower than dhcp metric"
@@ -578,10 +583,24 @@ test_firewall_lan_zone_includes_wg() {
   trap remove_fixture EXIT
   local out="$TEST_ROOT/fw.uci"
   render_firewall_batch "$out"
-  _grep "add_list firewall.lan_zone.network='lan'" "$out"
-  _grep "add_list firewall.lan_zone.network='wg_global'" "$out"
-  _grep "add_list firewall.lan_zone.network='wg_local'" "$out"
-  _grep "set firewall.lan_wan.dest='wan'" "$out"
+  # Factory-default anonymous lan zone (@zone[0]) is reused, not duplicated.
+  _grep "set firewall.@zone[0].name='lan'" "$out"
+  _grep "delete firewall.@zone[0].network" "$out"
+  _grep "add_list firewall.@zone[0].network='lan'" "$out"
+  _grep "add_list firewall.@zone[0].network='wg_global'" "$out"
+  _grep "add_list firewall.@zone[0].network='wg_local'" "$out"
+  # Factory-default lan->wan forwarding (@forwarding[0]) is reused.
+  _grep "set firewall.@forwarding[0].dest='wan'" "$out"
+  # No second named "lan"/"wan" zone is created (that would break policy).
+  _ngrep "firewall.lan_zone" "$out"
+  _ngrep "firewall.wan_zone" "$out"
+  _ngrep "firewall.lan_wan" "$out"
+  # The default network list must be cleared before members are re-added.
+  local del_ln add_ln
+  del_ln="$(grep -nF "delete firewall.@zone[0].network" "$out" | head -1 | cut -d: -f1)"
+  add_ln="$(grep -nF "add_list firewall.@zone[0].network='lan'" "$out" | head -1 | cut -d: -f1)"
+  ((del_ln < add_ln)) ||
+    fail "lan zone network list must be cleared before add_list"
 }
 
 test_firewall_wan_zone_includes_wan6() {
@@ -589,10 +608,20 @@ test_firewall_wan_zone_includes_wan6() {
   trap remove_fixture EXIT
   local out="$TEST_ROOT/fw.uci"
   render_firewall_batch "$out"
-  _grep "add_list firewall.wan_zone.network='wan'" "$out"
-  _grep "add_list firewall.wan_zone.network='wan6'" "$out"
-  _grep "add_list firewall.wan_zone.network='wanpppoe'" "$out"
-  _grep "add_list firewall.wan_zone.network='wanpppoe6'" "$out"
+  # Factory-default anonymous wan zone (@zone[1]) is reused, not duplicated.
+  _grep "set firewall.@zone[1].name='wan'" "$out"
+  _grep "set firewall.@zone[1].masq='1'" "$out"
+  _grep "delete firewall.@zone[1].network" "$out"
+  _grep "add_list firewall.@zone[1].network='wan'" "$out"
+  _grep "add_list firewall.@zone[1].network='wan6'" "$out"
+  _grep "add_list firewall.@zone[1].network='wanpppoe'" "$out"
+  _grep "add_list firewall.@zone[1].network='wanpppoe6'" "$out"
+  # The default network list must be cleared before members are re-added.
+  local del_ln add_ln
+  del_ln="$(grep -nF "delete firewall.@zone[1].network" "$out" | head -1 | cut -d: -f1)"
+  add_ln="$(grep -nF "add_list firewall.@zone[1].network='wan'" "$out" | head -1 | cut -d: -f1)"
+  ((del_ln < add_ln)) ||
+    fail "wan zone network list must be cleared before add_list"
 }
 
 test_firewall_wg_rules_ipv6_only() {
@@ -698,7 +727,56 @@ test_peer_template_content_and_mode() {
   _grepe "^DNS = 10\.192\.100\.1$" "$f"
   _grepe "^MTU = 1380$" "$f"
   _grepe "^PublicKey = " "$f"
-  _grep "Endpoint = [YOUR_HOME_IPV6_OR_DDNS_DOMAIN]:51820" "$f"
+  # The default placeholder is not an IPv6 literal, so it is left unbracketed.
+  _grep "Endpoint = YOUR_HOME_IPV6_OR_DDNS_DOMAIN:51820" "$f"
+  _ngrep "Endpoint = [YOUR_HOME_IPV6_OR_DDNS_DOMAIN]:51820" "$f"
+}
+
+test_peer_endpoint_ipv6_literal_is_bracketed() {
+  _prep '
+LAN_ADDRESS="10.192.0.1/24"
+WG_ENDPOINT_HOST="2001:db8::1"
+WG_GLOBAL_PEERS=(
+"name=phone address=10.192.100.2"
+)
+'
+  trap remove_fixture EXIT
+  local dir="$TEST_ROOT/clients"
+  render_all_peer_templates "$dir"
+  local f="$dir/wg_global-phone.conf"
+  _grep "Endpoint = [2001:db8::1]:51820" "$f"
+}
+
+test_peer_endpoint_hostname_is_unbracketed() {
+  _prep '
+LAN_ADDRESS="10.192.0.1/24"
+WG_ENDPOINT_HOST="home.example.com"
+WG_GLOBAL_PEERS=(
+"name=phone address=10.192.100.2"
+)
+'
+  trap remove_fixture EXIT
+  local dir="$TEST_ROOT/clients"
+  render_all_peer_templates "$dir"
+  local f="$dir/wg_global-phone.conf"
+  _grep "Endpoint = home.example.com:51820" "$f"
+  _ngrep "Endpoint = [home.example.com]:51820" "$f"
+}
+
+test_peer_endpoint_ipv4_literal_is_unbracketed() {
+  _prep '
+LAN_ADDRESS="10.192.0.1/24"
+WG_ENDPOINT_HOST="203.0.113.10"
+WG_GLOBAL_PEERS=(
+"name=phone address=10.192.100.2"
+)
+'
+  trap remove_fixture EXIT
+  local dir="$TEST_ROOT/clients"
+  render_all_peer_templates "$dir"
+  local f="$dir/wg_global-phone.conf"
+  _grep "Endpoint = 203.0.113.10:51820" "$f"
+  _ngrep "Endpoint = [203.0.113.10]:51820" "$f"
 }
 
 # ==================== Transactional install + rollback ====================
@@ -895,6 +973,9 @@ run_test "peer without pubkey gets generated keypair" test_peer_without_pubkey_g
 run_test "peer with pubkey uses placeholder private" test_peer_with_pubkey_uses_placeholder_private
 
 run_test "peer template content and mode" test_peer_template_content_and_mode
+run_test "peer endpoint IPv6 literal is bracketed" test_peer_endpoint_ipv6_literal_is_bracketed
+run_test "peer endpoint hostname is unbracketed" test_peer_endpoint_hostname_is_unbracketed
+run_test "peer endpoint IPv4 literal is unbracketed" test_peer_endpoint_ipv4_literal_is_unbracketed
 
 run_test "successful install writes all artifacts" test_successful_install_writes_all_artifacts
 run_test "rollback on validation failure leaves nothing" test_rollback_on_validation_failure_leaves_nothing

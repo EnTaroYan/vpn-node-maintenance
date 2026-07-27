@@ -431,6 +431,19 @@ _q() {
 _set() { printf 'set %s=%s\n' "$1" "$2"; }
 _setq() { printf 'set %s=%s\n' "$1" "$(_q "$2")"; }
 _addlist() { printf 'add_list %s=%s\n' "$1" "$(_q "$2")"; }
+_del() { printf 'delete %s\n' "$1"; }
+
+# Format a WireGuard endpoint host for a client template. IPv6 literals (which
+# contain a colon) must be wrapped in brackets; hostnames, DDNS domains, and
+# IPv4 literals are emitted verbatim.
+_format_wg_endpoint_host() {
+  local host="$1"
+  if [[ "$host" == *:* ]]; then
+    printf '[%s]' "$host"
+  else
+    printf '%s' "$host"
+  fi
+}
 
 _render_wg_interface_batch() {
   local iface="$1" address="$2" port="$3" privkey="$4"
@@ -496,7 +509,10 @@ render_network_batch() {
       _setq "network.${PPPOE_IFACE}.username" "$PPPOE_USERNAME"
       _setq "network.${PPPOE_IFACE}.password" "$PPPOE_PASSWORD"
       _setq "network.${PPPOE_IFACE}.metric" "$PPPOE_METRIC"
-      _setq "network.${PPPOE_IFACE}.ipv6" "auto"
+      # IPv6 on the PPPoE link is handled by the dedicated wanpppoe6 dhcpv6
+      # logical interface below, so disable the PPPoE interface's own automatic
+      # IPv6 sub-interface to avoid a redundant/conflicting second IPv6 client.
+      _setq "network.${PPPOE_IFACE}.ipv6" "0"
 
       # DHCPv6-PD tied to the PPPoE WAN path.
       _set "network.${PPPOE6_IFACE}" "interface"
@@ -517,35 +533,41 @@ render_network_batch() {
 render_firewall_batch() {
   local out="$1"
   {
+    # Reuse the factory-default anonymous firewall zones instead of creating
+    # second "lan"/"wan" zones (duplicate named zones break traffic policy).
+    # On a factory ImmortalWrt/OpenWrt config @zone[0] is lan and @zone[1] is
+    # wan; their default network lists are cleared before our members are added
+    # so no stale/duplicate interface references remain.
+
     # LAN zone: LAN plus both WireGuard interfaces (peer-to-peer and LAN
     # access via intra-zone forwarding).
-    _set "firewall.lan_zone" "zone"
-    _setq "firewall.lan_zone.name" "lan"
-    _setq "firewall.lan_zone.input" "ACCEPT"
-    _setq "firewall.lan_zone.output" "ACCEPT"
-    _setq "firewall.lan_zone.forward" "ACCEPT"
-    _addlist "firewall.lan_zone.network" "lan"
-    _addlist "firewall.lan_zone.network" "$WG_GLOBAL_IFACE"
-    _addlist "firewall.lan_zone.network" "$WG_LOCAL_IFACE"
+    _setq "firewall.@zone[0].name" "lan"
+    _setq "firewall.@zone[0].input" "ACCEPT"
+    _setq "firewall.@zone[0].output" "ACCEPT"
+    _setq "firewall.@zone[0].forward" "ACCEPT"
+    _del "firewall.@zone[0].network"
+    _addlist "firewall.@zone[0].network" "lan"
+    _addlist "firewall.@zone[0].network" "$WG_GLOBAL_IFACE"
+    _addlist "firewall.@zone[0].network" "$WG_LOCAL_IFACE"
 
     # WAN zone: every possible WAN and WAN6 logical interface.
-    _set "firewall.wan_zone" "zone"
-    _setq "firewall.wan_zone.name" "wan"
-    _setq "firewall.wan_zone.input" "REJECT"
-    _setq "firewall.wan_zone.output" "ACCEPT"
-    _setq "firewall.wan_zone.forward" "REJECT"
-    _setq "firewall.wan_zone.masq" "1"
-    _setq "firewall.wan_zone.mtu_fix" "1"
-    _addlist "firewall.wan_zone.network" "$WAN_IFACE"
-    _addlist "firewall.wan_zone.network" "$WAN6_IFACE"
+    _setq "firewall.@zone[1].name" "wan"
+    _setq "firewall.@zone[1].input" "REJECT"
+    _setq "firewall.@zone[1].output" "ACCEPT"
+    _setq "firewall.@zone[1].forward" "REJECT"
+    _setq "firewall.@zone[1].masq" "1"
+    _setq "firewall.@zone[1].mtu_fix" "1"
+    _del "firewall.@zone[1].network"
+    _addlist "firewall.@zone[1].network" "$WAN_IFACE"
+    _addlist "firewall.@zone[1].network" "$WAN6_IFACE"
     if [[ -n "$PPPOE_USERNAME" ]]; then
-      _addlist "firewall.wan_zone.network" "$PPPOE_IFACE"
-      _addlist "firewall.wan_zone.network" "$PPPOE6_IFACE"
+      _addlist "firewall.@zone[1].network" "$PPPOE_IFACE"
+      _addlist "firewall.@zone[1].network" "$PPPOE6_IFACE"
     fi
 
-    _set "firewall.lan_wan" "forwarding"
-    _setq "firewall.lan_wan.src" "lan"
-    _setq "firewall.lan_wan.dest" "wan"
+    # Reuse the factory-default lan->wan forwarding rather than adding a second.
+    _setq "firewall.@forwarding[0].src" "lan"
+    _setq "firewall.@forwarding[0].dest" "wan"
 
     # WireGuard ingress: IPv6-only UDP on WAN, one rule per interface.
     _set "firewall.wg_global_in" "rule"
@@ -601,8 +623,8 @@ render_peer_template() {
   {
     printf '%s\n' "$MANAGED_MARKER"
     printf '# WireGuard client template for peer "%s" on %s.\n' "$name" "$iface"
-    printf '# Replace the Endpoint host with your home public IPv6 (kept in\n'
-    printf '# brackets) or the DDNS domain configured later.\n'
+    printf '# Replace the Endpoint host with your home public IPv6 (bracketed\n'
+    printf '# automatically) or the DDNS domain configured later.\n'
     printf '[Interface]\n'
     if [[ -n "$priv" ]]; then
       printf 'PrivateKey = %s\n' "$priv"
@@ -616,7 +638,8 @@ render_peer_template() {
     printf 'PublicKey = %s\n' "$server_pub"
     [[ -n "$psk" ]] && printf 'PresharedKey = %s\n' "$psk"
     printf 'AllowedIPs = 0.0.0.0/0\n'
-    printf 'Endpoint = [%s]:%s\n' "${WG_ENDPOINT_HOST:-YOUR_HOME_IPV6_OR_DDNS_DOMAIN}" "$port"
+    printf 'Endpoint = %s:%s\n' \
+      "$(_format_wg_endpoint_host "${WG_ENDPOINT_HOST:-YOUR_HOME_IPV6_OR_DDNS_DOMAIN}")" "$port"
     printf 'PersistentKeepalive = 25\n'
   } >"$file"
   chmod 0600 "$file"
