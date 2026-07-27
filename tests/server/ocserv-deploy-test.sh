@@ -6,7 +6,7 @@ if ((EUID != 0)); then
   exec sudo --preserve-env=PATH bash "$0" "$@"
 fi
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$REPO_ROOT/tests/testlib.sh"
 
 # --real-tools: validate staged rendering against the actual system
@@ -40,7 +40,7 @@ write_config() {
 }
 
 source_deployer() {
-  OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/ocserv-deploy.sh"
+  OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/server/ocserv-deploy.sh"
 }
 
 # ---------- --real-tools: real ocserv/nft/ip staged validation ----------
@@ -541,7 +541,7 @@ FAKE_EOF
   cat >"$TEST_ROOT/scenario.sh" <<'SCENARIO_EOF'
 #!/usr/bin/env bash
 export PATH="$TEST_ROOT/bin:$PATH"
-OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/ocserv-deploy.sh"
+OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/server/ocserv-deploy.sh"
 load_config
 validate_common_config
 install -d -m 0700 "$(dirname "$SELF_SIGNED_CERT")"
@@ -576,7 +576,7 @@ OCSERV_CERT_MODE="selfsigned"
   local ssl_dir="$OCSERV_DEPLOY_ROOT/etc/ocserv/ssl"
   cat >"$TEST_ROOT/scenario.sh" <<'SCENARIO_EOF'
 #!/usr/bin/env bash
-OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/ocserv-deploy.sh"
+OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/server/ocserv-deploy.sh"
 load_config
 validate_common_config
 install -d -m 0700 "$(dirname "$SELF_SIGNED_CERT")"
@@ -823,7 +823,7 @@ MOCK_EOF
     PATH="$TEST_ROOT/bin:$PATH" OCSERV_DEPLOY_ROOT="$OCSERV_DEPLOY_ROOT" \
     bash <<'SUBSH' || rc=$?
 set -Eeuo pipefail
-OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/ocserv-deploy.sh"
+OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/server/ocserv-deploy.sh"
 CONFIRMED_PASSWORD="topsecret"
 trap 'printf "${CONFIRMED_PASSWORD+still_set}" > "${RESULT_FILE}"' EXIT
 set_user_password alice "$TEST_ROOT/ocpasswd"
@@ -1485,7 +1485,7 @@ _write_route_overlap_scenario() {
   cat >"$TEST_ROOT/scenario.sh" <<'SCENARIO_EOF'
 #!/usr/bin/env bash
 export PATH="$TEST_ROOT/bin:$PATH"
-OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/ocserv-deploy.sh"
+OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/server/ocserv-deploy.sh"
 load_config
 validate_common_config
 check_route_overlap
@@ -2086,7 +2086,7 @@ OCSERV_CERT_MODE="selfsigned"
     load_config
     validate_common_config
     render_network_helper "$1"
-  ' "$REPO_ROOT/ocserv-deploy.sh" "$helper"
+  ' "$REPO_ROOT/server/ocserv-deploy.sh" "$helper"
   grep -qFx 'readonly LOCK_FILE="/run/lock/ocserv-network.lock"' "$helper" ||
     fail "production rendering (empty ROOT_PREFIX) must preserve the exact real lock path"
 }
@@ -2408,7 +2408,7 @@ test_atomic_install_cleans_temp_on_failure() {
   install -d -m 0755 "$dir"
   cat >"$TEST_ROOT/scenario.sh" <<'SCENARIO_EOF'
 #!/usr/bin/env bash
-OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/ocserv-deploy.sh"
+OCSERV_DEPLOY_SOURCE_ONLY=1 source "$REPO_ROOT/server/ocserv-deploy.sh"
 _atomic_install_file 0644 "$MISSING_SRC" "$DEST"
 SCENARIO_EOF
   REPO_ROOT="$REPO_ROOT" OCSERV_DEPLOY_ROOT="$OCSERV_DEPLOY_ROOT" \
