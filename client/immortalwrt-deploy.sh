@@ -36,11 +36,17 @@ readonly HY2_CA_FILE="${HOMEPROXY_CERT_DIR}/hy2-server.pem"
 readonly LUCI_PUBLIC_CRT="${VPN_NODE_DIR}/luci-public.crt"
 readonly LUCI_PUBLIC_KEY_FILE="${VPN_NODE_DIR}/luci-public.key"
 
-# Optional Cloudflare AAAA DDNS updater, iface hotplug hook, and root crontab.
-readonly DDNS_UPDATER="${VPN_NODE_DIR}/cloudflare-aaaa.sh"
-readonly DDNS_HOTPLUG="${ROOT_PREFIX}/etc/hotplug.d/iface/99-vpn-node-ddns"
+# Dual-stack public ingress detector/updater (procd service + iface hotplug +
+# cron) and its runtime status file. The updater detects the public IPv4 and a
+# stable global IPv6, records status, and (when a home domain and Cloudflare
+# credentials are configured) synchronises DNS-only A and AAAA records.
+readonly INGRESS_LIBEXEC_DIR="${ROOT_PREFIX}/usr/libexec/vpn-node"
+readonly INGRESS_UPDATER="${INGRESS_LIBEXEC_DIR}/ingress-update"
+readonly INGRESS_INITD="${ROOT_PREFIX}/etc/init.d/vpn-node-ingress"
+readonly INGRESS_HOTPLUG="${ROOT_PREFIX}/etc/hotplug.d/iface/99-vpn-node-ingress"
+readonly INGRESS_STATE_FILE="${ROOT_PREFIX}/var/run/vpn-node/ingress.env"
 readonly CRONTAB_ROOT="${ROOT_PREFIX}/etc/crontabs/root"
-readonly DDNS_CRON_TAG="#vpn-node-ddns"
+readonly INGRESS_CRON_TAG="#vpn-node-ingress"
 
 # Logical interface / section names (never the physical device names).
 readonly WAN_IFACE="wan"
@@ -68,9 +74,10 @@ STAGED_CLIENTS=""
 STAGED_HY2_CA=""
 STAGED_LUCI_CRT=""
 STAGED_LUCI_KEY=""
-STAGED_DDNS_SCRIPT=""
-STAGED_DDNS_HOTPLUG=""
-STAGED_DDNS_CRON=""
+STAGED_INGRESS_UPDATER=""
+STAGED_INGRESS_INITD=""
+STAGED_INGRESS_HOTPLUG=""
+STAGED_INGRESS_CRON=""
 TRANSACTION_ACTIVE=0
 ROLLBACK_RUNNING=0
 declare -ga SNAPSHOT_TARGETS=()
@@ -614,6 +621,35 @@ _format_wg_endpoint_host() {
   fi
 }
 
+# Resolve the WireGuard endpoint host baked into client templates. Priority:
+#   1. an explicit WG_ENDPOINT_HOST override;
+#   2. the DDNS home domain (its managed A+AAAA cover both families, so the
+#      client picks whichever it can reach);
+#   3. the ingress detector's last-known preferred public literal (a public
+#      IPv4 is preferred over a global IPv6 when both are available);
+#   4. a dual-stack placeholder to edit by hand.
+# IPv6 literals are bracketed by the caller via _format_wg_endpoint_host.
+_wg_template_endpoint() {
+  if [[ -n "$WG_ENDPOINT_HOST" ]]; then
+    printf '%s' "$WG_ENDPOINT_HOST"
+    return
+  fi
+  if [[ -n "$HOME_DOMAIN" ]]; then
+    printf '%s' "$HOME_DOMAIN"
+    return
+  fi
+  local literal=""
+  if [[ -f "$INGRESS_STATE_FILE" ]]; then
+    literal="$(sed -n 's/^INGRESS_PREFERRED_LITERAL="\(.*\)"$/\1/p' \
+      "$INGRESS_STATE_FILE" | head -n1)"
+  fi
+  if [[ -n "$literal" ]]; then
+    printf '%s' "$literal"
+    return
+  fi
+  printf '%s' 'YOUR_HOME_IPV4_IPV6_OR_DDNS'
+}
+
 _render_wg_interface_batch() {
   local iface="$1" address="$2" port="$3" privkey="$4"
   _set "network.${iface}" "interface"
@@ -738,30 +774,32 @@ render_firewall_batch() {
     _setq "firewall.@forwarding[0].src" "lan"
     _setq "firewall.@forwarding[0].dest" "wan"
 
-    # WireGuard ingress: IPv6-only UDP on WAN, one rule per interface.
+    # WireGuard ingress: dual-stack UDP on WAN, one rule per interface. The
+    # outer transport works over the public IPv4 or IPv6, whichever the client
+    # can reach; the inner tunnel stays IPv4-only.
     _set "firewall.wg_global_in" "rule"
-    _setq "firewall.wg_global_in.name" "Allow-WireGuard-Global-IPv6"
+    _setq "firewall.wg_global_in.name" "Allow-WireGuard-Global"
     _setq "firewall.wg_global_in.src" "wan"
     _setq "firewall.wg_global_in.proto" "udp"
     _setq "firewall.wg_global_in.dest_port" "$WG_GLOBAL_PORT"
-    _setq "firewall.wg_global_in.family" "ipv6"
+    _setq "firewall.wg_global_in.family" "any"
     _setq "firewall.wg_global_in.target" "ACCEPT"
 
     _set "firewall.wg_local_in" "rule"
-    _setq "firewall.wg_local_in.name" "Allow-WireGuard-Local-IPv6"
+    _setq "firewall.wg_local_in.name" "Allow-WireGuard-Local"
     _setq "firewall.wg_local_in.src" "wan"
     _setq "firewall.wg_local_in.proto" "udp"
     _setq "firewall.wg_local_in.dest_port" "$WG_LOCAL_PORT"
-    _setq "firewall.wg_local_in.family" "ipv6"
+    _setq "firewall.wg_local_in.family" "any"
     _setq "firewall.wg_local_in.target" "ACCEPT"
 
-    # Public LuCI ingress: IPv6-only TCP on WAN for the separate uhttpd instance.
+    # Public LuCI ingress: dual-stack TCP on WAN for the separate uhttpd instance.
     _set "firewall.luci_public_in" "rule"
-    _setq "firewall.luci_public_in.name" "Allow-LuCI-Public-IPv6"
+    _setq "firewall.luci_public_in.name" "Allow-LuCI-Public"
     _setq "firewall.luci_public_in.src" "wan"
     _setq "firewall.luci_public_in.proto" "tcp"
     _setq "firewall.luci_public_in.dest_port" "$LUCI_PUBLIC_PORT"
-    _setq "firewall.luci_public_in.family" "ipv6"
+    _setq "firewall.luci_public_in.family" "any"
     _setq "firewall.luci_public_in.target" "ACCEPT"
   } >>"$out"
 }
@@ -878,8 +916,9 @@ render_homeproxy_batch() {
 
 # ==================== Public LuCI (uhttpd) UCI rendering ====================
 
-# A separate uhttpd instance bound to [::]:PORT only (IPv6-only HTTPS), distinct
-# from the factory LAN 'main' instance. No plain-HTTP listener is created.
+# A separate uhttpd instance bound to both 0.0.0.0:PORT and [::]:PORT (dual-stack
+# HTTPS), distinct from the factory LAN 'main' instance. No plain-HTTP listener
+# is created.
 render_uhttpd_batch() {
   local out="$1" crt key
   if [[ "$LUCI_CERT_MODE" == "letsencrypt" ]]; then
@@ -893,6 +932,7 @@ render_uhttpd_batch() {
     _set "uhttpd.${LUCI_UHTTPD_INSTANCE}" "uhttpd"
     _del "uhttpd.${LUCI_UHTTPD_INSTANCE}.listen_http"
     _del "uhttpd.${LUCI_UHTTPD_INSTANCE}.listen_https"
+    _addlist "uhttpd.${LUCI_UHTTPD_INSTANCE}.listen_https" "0.0.0.0:${LUCI_PUBLIC_PORT}"
     _addlist "uhttpd.${LUCI_UHTTPD_INSTANCE}.listen_https" "[::]:${LUCI_PUBLIC_PORT}"
     _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.redirect_https" "0"
     _setq "uhttpd.${LUCI_UHTTPD_INSTANCE}.home" "/www"
@@ -943,8 +983,8 @@ render_peer_template() {
   {
     printf '%s\n' "$MANAGED_MARKER"
     printf '# WireGuard client template for peer "%s" on %s.\n' "$name" "$iface"
-    printf '# Replace the Endpoint host with your home public IPv6 (bracketed\n'
-    printf '# automatically) or the DDNS domain configured later.\n'
+    printf '# Replace the Endpoint host with your home public IPv4, public IPv6\n'
+    printf '# (bracketed automatically), or the DDNS domain configured later.\n'
     printf '[Interface]\n'
     if [[ -n "$priv" ]]; then
       printf 'PrivateKey = %s\n' "$priv"
@@ -959,7 +999,7 @@ render_peer_template() {
     [[ -n "$psk" ]] && printf 'PresharedKey = %s\n' "$psk"
     printf 'AllowedIPs = 0.0.0.0/0\n'
     printf 'Endpoint = %s:%s\n' \
-      "$(_format_wg_endpoint_host "${WG_ENDPOINT_HOST:-YOUR_HOME_IPV6_OR_DDNS_DOMAIN}")" "$port"
+      "$(_format_wg_endpoint_host "$(_wg_template_endpoint)")" "$port"
     printf 'PersistentKeepalive = 25\n'
   } >"$file"
   chmod 0600 "$file"
@@ -1033,91 +1073,320 @@ generate_luci_selfsigned() {
   chmod 0644 "$crt"
 }
 
-# Cloudflare AAAA updater. Selects a stable global IPv6 (skipping temporary /
-# privacy / deprecated addresses) and publishes it as a DNS-only (proxied=false)
-# record. Credentials are baked into this root-only 0700 script.
-render_ddns_updater() {
+# Dual-stack public ingress detector/updater rendered to /usr/libexec. It runs
+# at boot (procd), on WAN hotplug, and via cron; detects the public IPv4
+# (confirmed by an external observer) and a stable global IPv6, records runtime
+# status under /var/run, and - when a home domain and Cloudflare credentials are
+# configured - synchronises DNS-only A and AAAA records tagged with a managed-by
+# comment. Credentials are baked into this root-only 0700 script. Detection
+# failures never block netifd, PPPoE, or DHCP.
+render_ingress_updater() {
   local dest="$1"
   install -d -m 0700 "$(dirname "$dest")"
   {
     printf '#!/bin/sh\n'
     printf '%s\n' "$MANAGED_MARKER"
-    printf "DOMAIN=%q\n" "$HOME_DOMAIN"
-    printf "ZONE_ID=%q\n" "$CLOUDFLARE_ZONE_ID"
-    printf "API_TOKEN=%q\n" "$CLOUDFLARE_API_TOKEN"
+    printf 'DOMAIN=%q\n' "$HOME_DOMAIN"
+    printf 'ZONE_ID=%q\n' "$CLOUDFLARE_ZONE_ID"
+    printf 'API_TOKEN=%q\n' "$CLOUDFLARE_API_TOKEN"
     cat <<'EOF'
 API='https://api.cloudflare.com/client/v4'
-set -eu
+set -u
 
-# Stable global-scope IPv6: skip temporary/privacy, deprecated and tentative
-# addresses and ULA (fc00::/7). The LAN advertises no IPv6, so the surviving
-# GUAs are the active WAN6 addresses; take the first stable one.
-select_stable_gua() {
-	ip -6 addr show scope global 2>/dev/null | awk '
-		$1 == "inet6" {
-			a = $2; sub(/\/.*/, "", a); bad = 0
-			for (i = 3; i <= NF; i++)
-				if ($i == "temporary" || $i == "deprecated" || $i == "tentative")
-					bad = 1
-			if (bad) next
-			la = tolower(a)
-			if (la ~ /^fe80:/) next
-			if (la ~ /^f[cd]/) next
-			print a
-		}' | head -n1
+# Optional relocation prefix for tests; empty in production (real paths).
+ROOT="${VPN_NODE_INGRESS_ROOT:-}"
+MANAGED_COMMENT='managed-by=vpn-node'
+STATE_DIR="${ROOT}/var/run/vpn-node"
+STATE_FILE="${STATE_DIR}/ingress.env"
+STAMP_FILE="${STATE_DIR}/last-run"
+LOCK_FILE="${ROOT}/var/lock/vpn-node-ingress.lock"
+DEBOUNCE=5
+
+# Candidate WAN logical interfaces inspected for a public IPv4 address.
+WAN_IFACES='wan wanpppoe'
+# External IPv4 observers; the observed address must equal the interface one.
+OBSERVERS='https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip'
+
+MODE="${1:-}"
+
+log() { logger -t vpn-node-ingress "$@" 2>/dev/null || true; }
+
+# Classify an IPv4 literal: prints "public" or "reserved". Reserved covers the
+# private (RFC1918), CGNAT (100.64/10), loopback, link-local, multicast and
+# other non-globally-routable ranges. Documentation/test-net blocks are treated
+# as public so they can stand in for real addresses.
+classify_ipv4() {
+  _ip="$1"
+  _o1="${_ip%%.*}"; _r="${_ip#*.}"
+  _o2="${_r%%.*}"; _r="${_r#*.}"
+  _o3="${_r%%.*}"; _o4="${_r##*.}"
+  for _o in "$_o1" "$_o2" "$_o3" "$_o4"; do
+    case "$_o" in ''|*[!0-9]*) echo reserved; return ;; esac
+    [ "$_o" -le 255 ] || { echo reserved; return; }
+  done
+  [ "$_o1" -eq 0 ] && { echo reserved; return; }
+  [ "$_o1" -eq 10 ] && { echo reserved; return; }
+  [ "$_o1" -eq 127 ] && { echo reserved; return; }
+  [ "$_o1" -ge 224 ] && { echo reserved; return; }
+  if [ "$_o1" -eq 100 ] && [ "$_o2" -ge 64 ] && [ "$_o2" -le 127 ]; then echo reserved; return; fi
+  if [ "$_o1" -eq 169 ] && [ "$_o2" -eq 254 ]; then echo reserved; return; fi
+  if [ "$_o1" -eq 172 ] && [ "$_o2" -ge 16 ] && [ "$_o2" -le 31 ]; then echo reserved; return; fi
+  if [ "$_o1" -eq 192 ] && [ "$_o2" -eq 168 ]; then echo reserved; return; fi
+  echo public
 }
 
-gua="$(select_stable_gua)"
-[ -n "$gua" ] || { logger -t vpn-node-ddns "no stable global IPv6 available"; exit 0; }
+# First public IPv4 held by a candidate WAN logical interface (queried via a
+# single non-blocking ubus status read; never waits on connectivity).
+public_ipv4() {
+  _cand=''
+  for _if in $WAN_IFACES; do
+    _js="$(ubus call network.interface."$_if" status 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$_js" ] || continue
+    _blk="$(printf '%s' "$_js" | sed -n 's/.*"ipv4-address":\[\([^]]*\)\].*/\1/p')"
+    [ -n "$_blk" ] || continue
+    for _a in $(printf '%s' "$_blk" | grep -o '"address":"[0-9.]*"' | sed 's/.*"\([0-9.]*\)"$/\1/'); do
+      if [ "$(classify_ipv4 "$_a")" = public ]; then _cand="$_a"; break; fi
+    done
+    [ -n "$_cand" ] && break
+  done
+  printf '%s' "$_cand"
+}
 
-auth="Authorization: Bearer ${API_TOKEN}"
-records="$(curl -fsS -H "$auth" -H 'Content-Type: application/json' \
-	"${API}/zones/${ZONE_ID}/dns_records?type=AAAA&name=${DOMAIN}")" ||
-	{ logger -t vpn-node-ddns "Cloudflare query failed"; exit 1; }
+# External IPv4 observation: prints the first well-formed observed address, or
+# nothing (and returns non-zero) if no observer is reachable.
+observe_ipv4() {
+  for _u in $OBSERVERS; do
+    _v="$(curl -4 -fsS --max-time 5 "$_u" 2>/dev/null | tr -d '[:space:]')"
+    case "$_v" in *.*.*.*) : ;; *) continue ;; esac
+    case "$_v" in *[!0-9.]*) continue ;; esac
+    printf '%s' "$_v"
+    return 0
+  done
+  return 1
+}
 
-rec_id="$(printf '%s' "$records" | sed -n 's/.*"id":"\([0-9a-f]\{1,\}\)".*/\1/p' | head -n1)"
-body='{"type":"AAAA","name":"'"$DOMAIN"'","content":"'"$gua"'","ttl":60,"proxied":false}'
+# First stable global IPv6: skip temporary/privacy, deprecated and tentative
+# addresses, ULA (fc00::/7) and link-local (fe80::/10). The LAN advertises no
+# IPv6, so the survivors are the active WAN6 GUAs.
+select_stable_gua() {
+  ip -6 addr show scope global 2>/dev/null | awk '
+    $1 == "inet6" {
+      a = $2; sub(/\/.*/, "", a); bad = 0
+      for (i = 3; i <= NF; i++)
+        if ($i == "temporary" || $i == "deprecated" || $i == "tentative")
+          bad = 1
+      if (bad) next
+      la = tolower(a)
+      if (la ~ /^fe80:/) next
+      if (la ~ /^f[cd]/) next
+      print a
+    }' | head -n1
+}
 
-if [ -n "$rec_id" ]; then
-	curl -fsS -X PUT -H "$auth" -H 'Content-Type: application/json' \
-		"${API}/zones/${ZONE_ID}/dns_records/${rec_id}" --data "$body" >/dev/null &&
-		logger -t vpn-node-ddns "updated ${DOMAIN} AAAA -> ${gua}"
-else
-	curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
-		"${API}/zones/${ZONE_ID}/dns_records" --data "$body" >/dev/null &&
-		logger -t vpn-node-ddns "created ${DOMAIN} AAAA -> ${gua}"
+has_default6() {
+  ip -6 route show default 2>/dev/null | grep -q .
+}
+
+# ---- Cloudflare helpers (reached only when a domain is configured) ----
+cf_list() {
+  curl -fsS -H "$auth" -H 'Content-Type: application/json' \
+    "${API}/zones/${ZONE_ID}/dns_records?type=$1&name=${DOMAIN}&per_page=100" 2>/dev/null
+}
+
+# IDs of records carrying the managed-by comment. Records are split on their
+# array boundaries (handles nested meta/settings objects) before filtering.
+cf_managed_ids() {
+  printf '%s' "$1" | tr -d '[:space:]' \
+    | awk '{ gsub(/},\{/, "}\n{"); print }' \
+    | grep -F "\"comment\":\"${MANAGED_COMMENT}\"" \
+    | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'
+}
+
+cf_body() {
+  printf '{"type":"%s","name":"%s","content":"%s","ttl":60,"proxied":false,"comment":"%s"}' \
+    "$1" "$DOMAIN" "$2" "$MANAGED_COMMENT"
+}
+
+cf_create() {
+  curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
+    "${API}/zones/${ZONE_ID}/dns_records" --data "$(cf_body "$1" "$2")" >/dev/null 2>&1 \
+    && log "created ${DOMAIN} $1 -> $2"
+}
+
+cf_update() {
+  curl -fsS -X PUT -H "$auth" -H 'Content-Type: application/json' \
+    "${API}/zones/${ZONE_ID}/dns_records/$3" --data "$(cf_body "$1" "$2")" >/dev/null 2>&1 \
+    && log "updated ${DOMAIN} $1 -> $2"
+}
+
+cf_delete() {
+  curl -fsS -X DELETE -H "$auth" -H 'Content-Type: application/json' \
+    "${API}/zones/${ZONE_ID}/dns_records/$2" >/dev/null 2>&1 \
+    && log "deleted ${DOMAIN} $1 record $2"
+}
+
+# Reconcile one record type against the detected state. Only managed records are
+# ever created, updated, or deleted; unknown state preserves everything; more
+# than one managed record is ambiguous and is left untouched (logged).
+sync_family() {
+  _type="$1"; _state="$2"; _content="$3"
+  case "$_state" in
+    available)
+      _resp="$(cf_list "$_type")" || { log "$_type list query failed"; return 0; }
+      _ids="$(cf_managed_ids "$_resp")"
+      _n=0
+      for _x in $_ids; do _n=$((_n + 1)); done
+      if [ "$_n" -eq 0 ]; then
+        cf_create "$_type" "$_content"
+      elif [ "$_n" -eq 1 ]; then
+        cf_update "$_type" "$_content" "$_ids"
+      else
+        log "ambiguous managed $_type records for ${DOMAIN}; skipping"
+      fi
+      ;;
+    unavailable)
+      _resp="$(cf_list "$_type")" || { log "$_type list query failed"; return 0; }
+      for _id in $(cf_managed_ids "$_resp"); do cf_delete "$_type" "$_id"; done
+      ;;
+    *)
+      : # unknown: preserve existing records and retry later
+      ;;
+  esac
+}
+
+# ---- single-flight lock: skip (never block) if another run holds it ----
+mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+exec 9>"$LOCK_FILE" 2>/dev/null || true
+if command -v flock >/dev/null 2>&1; then
+  flock -n 9 2>/dev/null || exit 0
 fi
+
+# ---- debounce hotplug/cron storms; --boot and --force always run ----
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+now="$(date +%s 2>/dev/null || echo 0)"
+if [ "$MODE" != "--boot" ] && [ "$MODE" != "--force" ] && [ -f "$STAMP_FILE" ]; then
+  last="$(cat "$STAMP_FILE" 2>/dev/null || echo 0)"
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  if [ "$last" -le "$now" ] && [ $((now - last)) -lt "$DEBOUNCE" ]; then
+    exit 0
+  fi
+fi
+printf '%s\n' "$now" >"$STAMP_FILE" 2>/dev/null || true
+
+# ---- IPv4: interface candidate confirmed by an external observer ----
+ipv4=''
+ipv4_state='unavailable'
+cand="$(public_ipv4)"
+if [ -n "$cand" ]; then
+  if obs="$(observe_ipv4)"; then
+    if [ "$obs" = "$cand" ]; then
+      ipv4="$cand"
+      ipv4_state='available'
+    else
+      ipv4_state='unknown'
+    fi
+  else
+    ipv4_state='unknown'
+  fi
+fi
+
+# ---- IPv6: stable GUA that has a default route ----
+ipv6=''
+ipv6_state='unavailable'
+gua="$(select_stable_gua)"
+if [ -n "$gua" ] && has_default6; then
+  ipv6="$gua"
+  ipv6_state='available'
+fi
+
+# ---- preferred family for no-domain WireGuard templates (IPv4 first) ----
+pref_family=''
+pref_literal=''
+if [ "$ipv4_state" = available ]; then
+  pref_family='ipv4'
+  pref_literal="$ipv4"
+elif [ "$ipv6_state" = available ]; then
+  pref_family='ipv6'
+  pref_literal="$ipv6"
+fi
+
+# ---- record runtime status atomically ----
+tmp="${STATE_FILE}.$$"
+{
+  printf 'INGRESS_IPV4="%s"\n' "$ipv4"
+  printf 'INGRESS_IPV4_STATE="%s"\n' "$ipv4_state"
+  printf 'INGRESS_IPV6="%s"\n' "$ipv6"
+  printf 'INGRESS_IPV6_STATE="%s"\n' "$ipv6_state"
+  printf 'INGRESS_PREFERRED_FAMILY="%s"\n' "$pref_family"
+  printf 'INGRESS_PREFERRED_LITERAL="%s"\n' "$pref_literal"
+  printf 'INGRESS_UPDATED="%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+} >"$tmp" 2>/dev/null && mv -f "$tmp" "$STATE_FILE" 2>/dev/null || true
+chmod 0644 "$STATE_FILE" 2>/dev/null || true
+
+# ---- DNS-only A/AAAA sync (only when a home domain is configured) ----
+if [ -n "$DOMAIN" ] && [ -n "$API_TOKEN" ] && [ -n "$ZONE_ID" ]; then
+  auth="Authorization: Bearer $API_TOKEN"
+  sync_family A "$ipv4_state" "$ipv4"
+  sync_family AAAA "$ipv6_state" "$ipv6"
+fi
+
+exit 0
 EOF
   } >"$dest"
   chmod 0700 "$dest"
 }
 
-# Hotplug hook: run the updater when a WAN IPv6 logical interface comes up.
-render_ddns_hotplug() {
-  local dest="$1"
+# procd one-shot service: run the ingress detector once at boot. Hotplug and
+# cron drive later refreshes; START is late so WAN/WAN6 have a chance to come up.
+render_ingress_initd() {
+  local dest="$1" rt="/usr/libexec/vpn-node/ingress-update"
+  install -d -m 0755 "$(dirname "$dest")"
+  {
+    printf '#!/bin/sh /etc/rc.common\n'
+    printf '%s\n' "$MANAGED_MARKER"
+    printf 'USE_PROCD=1\n'
+    printf 'START=95\n'
+    printf 'STOP=10\n'
+    printf '\n'
+    printf 'start_service() {\n'
+    printf '  procd_open_instance\n'
+    printf '  procd_set_param command %s --boot\n' "$rt"
+    printf '  procd_set_param stdout 1\n'
+    printf '  procd_set_param stderr 1\n'
+    printf '  procd_close_instance\n'
+    printf '}\n'
+  } >"$dest"
+  chmod 0755 "$dest"
+}
+
+# Hotplug hook: trigger detection when any WAN IPv4/IPv6 logical interface comes
+# up. Backgrounded so a slow detector never blocks netifd.
+render_ingress_hotplug() {
+  local dest="$1" rt="/usr/libexec/vpn-node/ingress-update"
   install -d -m 0755 "$(dirname "$dest")"
   {
     printf '#!/bin/sh\n'
     printf '%s\n' "$MANAGED_MARKER"
     printf '[ "$ACTION" = "ifup" ] || exit 0\n'
     printf 'case "$INTERFACE" in\n'
-    printf '  %s|%s) %s >/dev/null 2>&1 & ;;\n' \
-      "$WAN6_IFACE" "$PPPOE6_IFACE" "$DDNS_UPDATER"
+    printf '  %s|%s|%s|%s) %s --hotplug >/dev/null 2>&1 & ;;\n' \
+      "$WAN_IFACE" "$WAN6_IFACE" "$PPPOE_IFACE" "$PPPOE6_IFACE" "$rt"
     printf 'esac\n'
     printf 'exit 0\n'
   } >"$dest"
   chmod 0755 "$dest"
 }
 
-# Root crontab with our marked DDNS line, preserving all other entries.
-render_ddns_crontab() {
-  local dest="$1"
+# Root crontab with our marked 5-minute detection line, preserving all other
+# entries and replacing any previous tagged line.
+render_ingress_crontab() {
+  local dest="$1" rt="/usr/libexec/vpn-node/ingress-update"
   install -d -m 0755 "$(dirname "$dest")"
   : >"$dest"
   if [[ -f "$CRONTAB_ROOT" ]]; then
-    grep -vF "$DDNS_CRON_TAG" "$CRONTAB_ROOT" >"$dest" || true
+    grep -vF "$INGRESS_CRON_TAG" "$CRONTAB_ROOT" >"$dest" || true
   fi
-  printf '*/15 * * * * %s %s\n' "$DDNS_UPDATER" "$DDNS_CRON_TAG" >>"$dest"
+  printf '*/5 * * * * %s --cron %s\n' "$rt" "$INGRESS_CRON_TAG" >>"$dest"
   chmod 0600 "$dest"
 }
 
@@ -1206,10 +1475,12 @@ reload_services() {
     service homeproxy enable >/dev/null 2>&1 || true
     service homeproxy restart || die "failed to restart homeproxy"
   fi
-  if ddns_enabled; then
-    service cron enable >/dev/null 2>&1 || true
-    service cron restart >/dev/null 2>&1 || true
-  fi
+  # The dual-stack ingress detector (procd + cron) is always installed; enable
+  # and (re)start both so boot detection and the 5-minute job take effect.
+  service vpn-node-ingress enable >/dev/null 2>&1 || true
+  service vpn-node-ingress restart >/dev/null 2>&1 || true
+  service cron enable >/dev/null 2>&1 || true
+  service cron restart >/dev/null 2>&1 || true
 }
 
 # ==================== Transaction and rollback ====================
@@ -1247,9 +1518,10 @@ begin_transaction() {
   STAGED_HY2_CA="${TXN_DIR}/stage/hy2_server_ca.pem"
   STAGED_LUCI_CRT="${TXN_DIR}/stage/luci-public.crt"
   STAGED_LUCI_KEY="${TXN_DIR}/stage/luci-public.key"
-  STAGED_DDNS_SCRIPT="${TXN_DIR}/stage/cloudflare-aaaa.sh"
-  STAGED_DDNS_HOTPLUG="${TXN_DIR}/stage/99-vpn-node-ddns"
-  STAGED_DDNS_CRON="${TXN_DIR}/stage/crontab-root"
+  STAGED_INGRESS_UPDATER="${TXN_DIR}/stage/ingress-update"
+  STAGED_INGRESS_INITD="${TXN_DIR}/stage/vpn-node-ingress.init"
+  STAGED_INGRESS_HOTPLUG="${TXN_DIR}/stage/99-vpn-node-ingress"
+  STAGED_INGRESS_CRON="${TXN_DIR}/stage/crontab-root"
   SNAPSHOT_TARGETS=()
   SNAPSHOT_EXISTED=()
   SNAPSHOT_MODE=()
@@ -1327,11 +1599,13 @@ stage_managed_files() {
   if [[ "$LUCI_CERT_MODE" == "selfsigned" ]]; then
     generate_luci_selfsigned "$STAGED_LUCI_CRT" "$STAGED_LUCI_KEY"
   fi
-  if ddns_enabled; then
-    render_ddns_updater "$STAGED_DDNS_SCRIPT"
-    render_ddns_hotplug "$STAGED_DDNS_HOTPLUG"
-    render_ddns_crontab "$STAGED_DDNS_CRON"
-  fi
+  # The ingress detector, procd service, hotplug hook and cron entry are always
+  # rendered; the detector performs the Cloudflare A/AAAA sync only when a home
+  # domain and credentials are present (ddns_enabled).
+  render_ingress_updater "$STAGED_INGRESS_UPDATER"
+  render_ingress_initd "$STAGED_INGRESS_INITD"
+  render_ingress_hotplug "$STAGED_INGRESS_HOTPLUG"
+  render_ingress_crontab "$STAGED_INGRESS_CRON"
 }
 
 validate_staged_files() {
@@ -1348,9 +1622,11 @@ validate_staged_files() {
   if proxy_enabled && [[ "$HY2_CERT_MODE" == "selfsigned" ]]; then
     [[ -s "$STAGED_HY2_CA" ]] || die "HY2 self-signed trust anchor is empty"
   fi
-  if ddns_enabled; then
-    [[ -s "$STAGED_DDNS_SCRIPT" ]] || die "Cloudflare DDNS updater was not rendered"
-  fi
+  [[ -s "$STAGED_INGRESS_UPDATER" ]] || die "ingress detector was not rendered"
+  # The detector runs under ash/busybox at runtime; reject syntax errors early.
+  sh -n "$STAGED_INGRESS_UPDATER" || die "ingress detector is not POSIX-sh clean"
+  [[ -s "$STAGED_INGRESS_INITD" ]] || die "ingress procd service was not rendered"
+  [[ -s "$STAGED_INGRESS_HOTPLUG" ]] || die "ingress hotplug hook was not rendered"
 }
 
 install_staged_files() {
@@ -1373,14 +1649,15 @@ install_staged_files() {
     _atomic_install_file 0644 "$STAGED_LUCI_CRT" "$LUCI_PUBLIC_CRT"
     _atomic_install_file 0600 "$STAGED_LUCI_KEY" "$LUCI_PUBLIC_KEY_FILE"
   fi
-  if ddns_enabled; then
-    install -d -m 0700 "$VPN_NODE_DIR"
-    _atomic_install_file 0700 "$STAGED_DDNS_SCRIPT" "$DDNS_UPDATER"
-    install -d -m 0755 "$(dirname "$DDNS_HOTPLUG")"
-    _atomic_install_file 0755 "$STAGED_DDNS_HOTPLUG" "$DDNS_HOTPLUG"
-    install -d -m 0755 "$(dirname "$CRONTAB_ROOT")"
-    _atomic_install_file 0600 "$STAGED_DDNS_CRON" "$CRONTAB_ROOT"
-  fi
+  # Dual-stack ingress detector + procd service + hotplug hook + cron entry.
+  install -d -m 0755 "$INGRESS_LIBEXEC_DIR"
+  _atomic_install_file 0700 "$STAGED_INGRESS_UPDATER" "$INGRESS_UPDATER"
+  install -d -m 0755 "$(dirname "$INGRESS_INITD")"
+  _atomic_install_file 0755 "$STAGED_INGRESS_INITD" "$INGRESS_INITD"
+  install -d -m 0755 "$(dirname "$INGRESS_HOTPLUG")"
+  _atomic_install_file 0755 "$STAGED_INGRESS_HOTPLUG" "$INGRESS_HOTPLUG"
+  install -d -m 0755 "$(dirname "$CRONTAB_ROOT")"
+  _atomic_install_file 0600 "$STAGED_INGRESS_CRON" "$CRONTAB_ROOT"
 }
 
 print_install_summary() {
@@ -1397,21 +1674,22 @@ print_install_summary() {
     "$WG_GLOBAL_ADDRESS" "$WG_GLOBAL_PORT" "$WG_GLOBAL_PUBLIC_KEY"
   printf 'WireGuard %s: %s UDP %s pubkey %s\n' "$WG_LOCAL_IFACE" \
     "$WG_LOCAL_ADDRESS" "$WG_LOCAL_PORT" "$WG_LOCAL_PUBLIC_KEY"
-  printf 'WireGuard ingress is IPv6-only; requires a public IPv6 on WAN6.\n'
+  printf 'WireGuard ingress is dual-stack (fw4 family any); needs a public IPv4 or IPv6 on WAN.\n'
   printf 'Client templates: %s\n' "$CLIENT_TEMPLATE_DIR"
   if proxy_enabled; then
     printf 'HomeProxy: GFWList redirect_tproxy, IPv4-only; default node HY2 (%s), manual node REALITY.\n' \
       "$HP_HY2_NODE"
     printf 'HY2 certificate mode: %s\n' "$HY2_CERT_MODE"
   fi
+  printf 'Ingress detector: /usr/libexec/vpn-node/ingress-update (procd + hotplug + 5-min cron).\n'
   if ddns_enabled; then
-    printf 'Cloudflare AAAA DDNS enabled for %s (DNS-only, hotplug + cron).\n' \
+    printf 'Cloudflare DDNS enabled for %s: DNS-only A+AAAA, managed-by comment.\n' \
       "$HOME_DOMAIN"
   else
-    printf 'Cloudflare AAAA DDNS: disabled (no home domain/token).\n'
+    printf 'Cloudflare DDNS: disabled (no home domain/token); ingress status still recorded.\n'
   fi
-  printf 'Public LuCI: IPv6-only HTTPS on [::]:%s (%s certificate).\n' \
-    "$LUCI_PUBLIC_PORT" "$LUCI_CERT_MODE"
+  printf 'Public LuCI: dual-stack HTTPS on 0.0.0.0:%s and [::]:%s (%s certificate).\n' \
+    "$LUCI_PUBLIC_PORT" "$LUCI_PUBLIC_PORT" "$LUCI_CERT_MODE"
   printf 'LAN moved to %s; reconnect the admin host to %s.\n' \
     "$LAN_ADDRESS" "${LAN_ADDRESS%/*}"
 }
@@ -1429,8 +1707,9 @@ install_client() {
   snapshot_target "$HY2_CA_FILE"
   snapshot_target "$LUCI_PUBLIC_CRT"
   snapshot_target "$LUCI_PUBLIC_KEY_FILE"
-  snapshot_target "$DDNS_UPDATER"
-  snapshot_target "$DDNS_HOTPLUG"
+  snapshot_target "$INGRESS_UPDATER"
+  snapshot_target "$INGRESS_INITD"
+  snapshot_target "$INGRESS_HOTPLUG"
   snapshot_target "$CRONTAB_ROOT"
   stage_managed_files
   validate_staged_files
@@ -1477,10 +1756,10 @@ cmd_check() {
   if [[ "$LUCI_CERT_MODE" == "selfsigned" ]]; then
     generate_luci_selfsigned "$tmp/luci-public.crt" "$tmp/luci-public.key"
   fi
-  if ddns_enabled; then
-    render_ddns_updater "$tmp/cloudflare-aaaa.sh"
-    render_ddns_hotplug "$tmp/99-vpn-node-ddns"
-  fi
+  render_ingress_updater "$tmp/ingress-update"
+  render_ingress_initd "$tmp/vpn-node-ingress.init"
+  render_ingress_hotplug "$tmp/99-vpn-node-ingress"
+  sh -n "$tmp/ingress-update" || die "ingress detector is not POSIX-sh clean"
   validate_uci_batch "$tmp/batch.uci" || die "UCI batch failed validation"
   validate_peer_templates "$tmp/clients" ||
     die "WireGuard client template failed validation"

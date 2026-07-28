@@ -233,7 +233,7 @@ WAN/LAN。
 
 `LAN_ADDRESS`（默认 `10.192.0.1/24`）替换路由器原有 LAN 地址；LAN 上关闭
 IPv6 RA/DHCPv6 广播，dnsmasq 过滤 AAAA 应答（家中到 VPS 及代理出口强制走
-IPv4，IPv6 只用于 WireGuard 外层传输和公网 LuCI 入站）。**安装后必须改用新
+IPv4；公网 IPv6 仅用于 WireGuard/公网 LuCI 的双栈入站之一）。**安装后必须改用新
 LAN 地址重新连接管理界面**（见上方"安装前必读"）。
 
 ### WAN：PPPoE 与 DHCP 同时下发
@@ -260,10 +260,12 @@ LAN 地址重新连接管理界面**（见上方"安装前必读"）。
 | `wg-global` | `10.192.100.1/24` | `51820` | 客户端流量强制经由 VPS 代理出口（HomeProxy 按来源网段识别） |
 | `wg-local` | `10.192.200.1/24` | `51821` | 按 GFWList 分流（与 LAN 同策略），适合仅需访问家中局域网设备（例如局域网内游戏主机/NAS）的场景 |
 
-- **外层**（WireGuard UDP 监听）仅通过 WAN6 防火墙开放，**需要家中公网
-  IPv6**；没有公网 IPv6 时这两个入口都不可用。`WG_ENDPOINT_HOST` 留空则生成
-  的客户端模板中为占位符，需自行填入当前 IPv6 或家中 DDNS 域名。
-- **内层**隧道流量仅 IPv4（`AllowedIPs=0.0.0.0/0`），因此客户端设备本身不
+- **外层**（WireGuard UDP 监听）由 fw4 以 `family any` 双栈开放，可经由**家中
+  公网 IPv4 或公网 IPv6**入站（两者任一可用即可，客户端自行选择）；两者都没有
+  时这两个入口才不可用。`WG_ENDPOINT_HOST` 留空时，模板依次取：DDNS `HOME_DOMAIN`
+  （其 A+AAAA 同时覆盖双栈）→ 入口探测器记录的优选公网字面量（公网 IPv4 优先，
+  否则全局 IPv6）→ 占位符（需自行填写）。
+- **内层**隧道流量仍仅 IPv4（`AllowedIPs=0.0.0.0/0`），因此客户端设备本身不
   需要支持 IPv6 即可通过 wg-local 直接访问家中局域网（含仅支持 IPv4 的
   游戏主机等设备）；MTU 默认 `1380`，为外层 IPv6 报头留出余量。
 - 密钥缺失时自动生成并持久化；对端使用 `/32` AllowedIPs，允许 peer 之间和
@@ -300,25 +302,44 @@ WireGuard，不涉及代理。
     global-proxy 列表，**LuCI 中手工添加的代理/直连列表会被保留**，不会被
     覆盖或清空。
 
-### 可选：家中 IPv6 DDNS
+### 入口探测与可选：家中双栈 DDNS（A + AAAA）
 
-`HOME_DOMAIN`、`CLOUDFLARE_ZONE_ID`、`CLOUDFLARE_API_TOKEN` 三者都填写时才
-启用；任一为空则不配置 DDNS，客户端模板中直接使用当前公网 IPv6 字面量。
-启用后由自定义脚本从当前活跃的 WAN6 逻辑接口中选取稳定的全局 IPv6
-（跳过 temporary/deprecated 临时地址），以 DNS-only（灰云）AAAA 记录更新
-Cloudflare，由 iface hotplug 和 cron 共同触发。
+每次开机（procd 服务 `vpn-node-ingress`）、WAN 逻辑接口 `ifup`（hotplug）以及
+每 5 分钟（cron）运行 `/usr/libexec/vpn-node/ingress-update`，用锁 + debounce
+去抖，探测家中公网入口并写入 `/var/run/vpn-node/ingress.env`（含地址、
+available/unknown/unavailable 状态、优选族和时间），供 WireGuard 模板选择使用；
+探测失败不影响 netifd、PPPoE 或 DHCP。
+
+- **IPv4**：从 `wan`/`wanpppoe` 逻辑接口取地址，排除私网、CGNAT（100.64/10）和
+  保留地址；再经至少一个外部观察服务确认「观察到的 IP == 接口 IP」才判定
+  available。观察服务全部不可达或观察值不一致时判为 **unknown**，**不删除**已有
+  DNS 记录，等待下次重试。
+- **IPv6**：选取带默认路由的稳定全局 GUA，跳过 temporary/deprecated/tentative、
+  ULA 和 link-local。
+
+`HOME_DOMAIN`、`CLOUDFLARE_ZONE_ID`、`CLOUDFLARE_API_TOKEN` 三者都填写时，同一
+探测器还会以 DNS-only（灰云）方式同步 Cloudflare **A 和 AAAA**：
+
+- 明确 available：创建/更新记录，并写入 `managed-by=vpn-node` comment。
+- 明确 unavailable：仅删除带该 comment 的对应记录，不动任何手工/第三方记录。
+- unknown：保留现有记录并重试。
+- 同类型出现多个受管记录时视为歧义，跳过并记日志。
+
+任一 Cloudflare 变量为空则不做 DNS 同步（探测器仍记录状态，客户端模板改用探测
+到的优选公网字面量或占位符）。
 
 ### 公网 LuCI（务必先设强密码）
 
-安装会在 `[::]:${LUCI_PUBLIC_PORT}`（默认 `10443`）上开启一个与 LAN 管理
-界面**分离**的 uhttpd 实例，仅监听 IPv6，只在 WAN6 防火墙放行这一个 TCP
-端口。
+安装会在 `0.0.0.0:${LUCI_PUBLIC_PORT}` 与 `[::]:${LUCI_PUBLIC_PORT}`（默认
+`10443`）上开启一个与 LAN 管理界面**分离**的双栈 uhttpd 实例，由单条
+`family any` 的 fw4 规则在 WAN 放行这一个 TCP 端口。
 
 - `LUCI_CERT_MODE=selfsigned`（默认）：自签名证书，浏览器会提示不受信任
   警告，属预期行为。
 - `LUCI_CERT_MODE=letsencrypt`：使用 ACME + Cloudflare DNS-01 签发证书，
-  需要已配置 `HOME_DOMAIN` 及 Cloudflare 凭据。
-- **这是完整的 root 管理面，直接暴露在公网 IPv6 上**；非标准端口仅减少
+  需要已配置 `HOME_DOMAIN` 及 Cloudflare 凭据；DNS-01 证书与地址族无关，
+  A/AAAA 变化无需重签。
+- **这是完整的 root 管理面，直接暴露在公网（IPv4/IPv6）上**；非标准端口仅减少
   扫描噪声，不构成安全边界，且 `uhttpd` 没有登录失败次数锁定。启用前务必
   将 LuCI/root 密码设置为强且唯一的密码，并自行评估暴露 root 管理面到公网
   的风险。
@@ -329,7 +350,8 @@ Cloudflare，由 iface hotplug 和 cron 共同触发。
 ./client/immortalwrt-deploy.sh show-wireguard
 uci show homeproxy
 uci show network
-logread | grep vpn-node-ddns
+cat /var/run/vpn-node/ingress.env
+logread | grep vpn-node-ingress
 ```
 
 ## 验证 / 测试
@@ -343,17 +365,20 @@ git diff --check
 ```
 
 所有测试套件都在临时目录 / mocked root 中运行，使用桩程序模拟
-`uci`/`ubus`/`ip`/`service`/`opkg`/`apk`，**不会修改任何真实的 VPS 服务、
-ImmortalWrt 配置或主机防火墙**；`check` 子命令同样只在临时目录渲染和校验，
-不做任何实机改动。
+`uci`/`ubus`/`ip`/`curl`/`service`/`opkg`/`apk`，**不会修改任何真实的 VPS 服务、
+ImmortalWrt 配置、Cloudflare DNS 或主机防火墙**；渲染出的入口探测器也仅在临时
+根目录（`VPN_NODE_INGRESS_ROOT`）下执行，`check` 子命令同样只在临时目录渲染和
+校验，不做任何实机改动。
 
 ## 已知边界
 
 - 单个 VPS IP 被封锁时，HY2、REALITY 和 ocserv 会同时受影响（三者共用同一
   出口 IP）；没有协议可以保证长期绕过封锁，Hysteria2 尤其可能受跨境 UDP
   QoS 限速或整体封锁影响。
-- 家中或远端客户端没有公网 IPv6 时，WireGuard 和公网 LuCI 的公网入口均不
-  可用（这两项功能仅经由 WAN6 开放）。
+- 家中既没有可用公网 IPv4（经外部观察确认）也没有稳定公网 IPv6 时，WireGuard
+  与公网 LuCI 的公网入口才不可用；两者任一可用即可入站（fw4 以 `family any`
+  双栈开放）。外部 IPv4 观察服务不可达时入口状态记为 unknown，此时保留既有 DNS
+  记录、不做误删。
 - SoftEther 自动部署脚本尚未实现。计划使用 443 端口，并与 ocserv/sing-box
   使用不同端口、地址池和 nftables 表，避免冲突。
 

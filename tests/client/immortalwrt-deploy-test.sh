@@ -131,6 +131,35 @@ CLOUDFLARE_API_TOKEN="token456"
 LUCI_CERT_MODE="letsencrypt"
 '
 
+# Home Cloudflare DDNS without a proxy: the dual-stack ingress detector renders
+# with a domain + credentials so it can sync A and AAAA records.
+INGRESS_CONFIG='
+LAN_ADDRESS="10.192.0.1/24"
+HOME_DOMAIN="home.example.com"
+CLOUDFLARE_ZONE_ID="zone123"
+CLOUDFLARE_API_TOKEN="token456"
+'
+
+# Same, but with WireGuard peers so client templates are rendered.
+INGRESS_PEER_CONFIG='
+LAN_ADDRESS="10.192.0.1/24"
+HOME_DOMAIN="home.example.com"
+CLOUDFLARE_ZONE_ID="zone123"
+CLOUDFLARE_API_TOKEN="token456"
+WG_GLOBAL_PEERS=(
+"name=phone address=10.192.100.2"
+)
+'
+
+# No domain at all: the detector still renders (status only) but performs no
+# Cloudflare sync.
+NODOMAIN_PEER_CONFIG='
+LAN_ADDRESS="10.192.0.1/24"
+WG_GLOBAL_PEERS=(
+"name=phone address=10.192.100.2"
+)
+'
+
 _grep() { grep -qF "$1" "$2" || fail "expected to find: $1"; }
 _grepe() { grep -qE "$1" "$2" || fail "expected to match: $1"; }
 _ngrep() { ! grep -qF "$1" "$2" || fail "unexpected content: $1"; }
@@ -260,6 +289,95 @@ _prep() {
   LAN_DEVICE="eth1"
   resolve_wireguard_material
 }
+
+# ---------- ingress detector execution harness ----------
+#
+# Renders the runtime detector and executes it under a relocated root
+# (VPN_NODE_INGRESS_ROOT) with mocked ubus/ip/curl/logger. No real network,
+# interface, or Cloudflare state is ever touched; ubus returns canned interface
+# JSON, ip returns canned addresses/routes, and curl simulates the external
+# IPv4 observer and the Cloudflare API from ctl fixtures.
+_write_ingress_mocks() {
+  cat >"$TEST_ROOT/bin/ubus" <<'EOF'
+#!/bin/sh
+printf 'ARGS: %s\n' "$*" >> "$TEST_ROOT/ubus-args.log"
+obj=""; prev=""
+for a in "$@"; do case "$prev" in call) obj="$a" ;; esac; prev="$a"; done
+iface="${obj##*.}"
+f="$TEST_ROOT/ctl/ubus.$iface"
+[ -f "$f" ] && cat "$f"
+exit 0
+EOF
+  cat >"$TEST_ROOT/bin/ip" <<'EOF'
+#!/bin/sh
+printf 'ARGS: %s\n' "$*" >> "$TEST_ROOT/ip-args.log"
+case "$*" in
+  *"-6 addr"*) cat "$TEST_ROOT/ctl/ip6_addr" 2>/dev/null || true ;;
+  *"-6 route"*) cat "$TEST_ROOT/ctl/ip6_route" 2>/dev/null || true ;;
+esac
+exit 0
+EOF
+  cat >"$TEST_ROOT/bin/curl" <<'EOF'
+#!/bin/sh
+url=""; method="GET"; data=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -X) method="$2"; shift 2 ;;
+    --data|--data-raw|-d) data="$2"; shift 2 ;;
+    http://*|https://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+case "$url" in
+  *api.cloudflare.com*)
+    printf '%s\t%s\t%s\n' "$method" "$url" "$data" >> "$TEST_ROOT/ctl/cf.log"
+    if [ "$method" = GET ]; then
+      t=$(expr "$url" : '.*type=\([A-Za-z]*\)')
+      f="$TEST_ROOT/ctl/cf_records_${t}.json"
+      if [ -f "$f" ]; then cat "$f"; else printf '{"result":[],"success":true}'; fi
+    else
+      printf '{"result":{"id":"newid"},"success":true}'
+    fi
+    ;;
+  *)
+    [ -f "$TEST_ROOT/ctl/observe_fail" ] && exit 22
+    cat "$TEST_ROOT/ctl/observe_ip" 2>/dev/null || true
+    ;;
+esac
+exit 0
+EOF
+  cat >"$TEST_ROOT/bin/logger" <<'EOF'
+#!/bin/sh
+while [ $# -gt 0 ]; do case "$1" in -t) shift 2 ;; *) break ;; esac; done
+printf 'LOG %s\n' "$*" >> "$TEST_ROOT/ctl/logger.log"
+exit 0
+EOF
+  chmod +x "$TEST_ROOT/bin/ubus" "$TEST_ROOT/bin/ip" "$TEST_ROOT/bin/curl" \
+    "$TEST_ROOT/bin/logger"
+}
+
+# Renders the detector for $config into $TEST_ROOT/ingress-update.
+_render_detector() {
+  local config="${1:-$INGRESS_CONFIG}"
+  new_fixture
+  write_config "$config"
+  install -d -m 0700 "$TEST_ROOT/bin" "$TEST_ROOT/ctl"
+  _write_ingress_mocks
+  source_deployer
+  load_config
+  render_ingress_updater "$TEST_ROOT/ingress-update"
+}
+
+# Executes the rendered detector under a relocated root with the mocks on PATH.
+_run_detector() {
+  local mode="${1:-}"
+  install -d -m 0755 "$TEST_ROOT/iroot"
+  PATH="$TEST_ROOT/bin:$PATH" VPN_NODE_INGRESS_ROOT="$TEST_ROOT/iroot" \
+    TEST_ROOT="$TEST_ROOT" sh "$TEST_ROOT/ingress-update" "$mode"
+}
+
+_state_file() { printf '%s' "$TEST_ROOT/iroot/var/run/vpn-node/ingress.env"; }
+_cf_log() { printf '%s' "$TEST_ROOT/ctl/cf.log"; }
 
 # ==================== Config security ====================
 
@@ -689,17 +807,22 @@ test_firewall_wan_zone_includes_wan6() {
     fail "wan zone network list must be cleared before add_list"
 }
 
-test_firewall_wg_rules_ipv6_only() {
+test_firewall_wg_rules_family_any() {
   _prep "$VALID_CONFIG"
   trap remove_fixture EXIT
   local out="$TEST_ROOT/fw.uci"
   render_firewall_batch "$out"
-  _grep "set firewall.wg_global_in.family='ipv6'" "$out"
+  # Dual-stack ingress: WireGuard UDP is opened for both address families so the
+  # tunnel outer transport works over public IPv4 or IPv6.
+  _grep "set firewall.wg_global_in.family='any'" "$out"
   _grep "set firewall.wg_global_in.proto='udp'" "$out"
   _grep "set firewall.wg_global_in.dest_port='51820'" "$out"
   _grep "set firewall.wg_global_in.target='ACCEPT'" "$out"
-  _grep "set firewall.wg_local_in.family='ipv6'" "$out"
+  _grep "set firewall.wg_local_in.family='any'" "$out"
   _grep "set firewall.wg_local_in.dest_port='51821'" "$out"
+  # The old IPv6-only restriction must be gone.
+  _ngrep "set firewall.wg_global_in.family='ipv6'" "$out"
+  _ngrep "set firewall.wg_local_in.family='ipv6'" "$out"
 }
 
 # ==================== dnsmasq / IPv6 boundary ====================
@@ -792,9 +915,10 @@ test_peer_template_content_and_mode() {
   _grepe "^DNS = 10\.192\.100\.1$" "$f"
   _grepe "^MTU = 1380$" "$f"
   _grepe "^PublicKey = " "$f"
-  # The default placeholder is not an IPv6 literal, so it is left unbracketed.
-  _grep "Endpoint = YOUR_HOME_IPV6_OR_DDNS_DOMAIN:51820" "$f"
-  _ngrep "Endpoint = [YOUR_HOME_IPV6_OR_DDNS_DOMAIN]:51820" "$f"
+  # With no explicit host, domain, or detected address, a dual-stack placeholder
+  # is emitted (not an IPv6 literal, so it is left unbracketed).
+  _grep "Endpoint = YOUR_HOME_IPV4_IPV6_OR_DDNS:51820" "$f"
+  _ngrep "Endpoint = [YOUR_HOME_IPV4_IPV6_OR_DDNS]:51820" "$f"
 }
 
 test_peer_endpoint_ipv6_literal_is_bracketed() {
@@ -842,6 +966,77 @@ WG_GLOBAL_PEERS=(
   local f="$dir/wg_global-phone.conf"
   _grep "Endpoint = 203.0.113.10:51820" "$f"
   _ngrep "Endpoint = [203.0.113.10]:51820" "$f"
+}
+
+test_peer_endpoint_uses_domain_when_no_host() {
+  # With a home domain but no explicit WG_ENDPOINT_HOST, the template resolves
+  # the endpoint through the DDNS domain (which carries both A and AAAA).
+  _prep "$INGRESS_PEER_CONFIG"
+  trap remove_fixture EXIT
+  local dir="$TEST_ROOT/clients"
+  render_all_peer_templates "$dir"
+  local f="$dir/wg_global-phone.conf"
+  _grep "Endpoint = home.example.com:51820" "$f"
+}
+
+test_peer_endpoint_explicit_host_overrides_domain() {
+  _prep '
+LAN_ADDRESS="10.192.0.1/24"
+HOME_DOMAIN="home.example.com"
+CLOUDFLARE_ZONE_ID="zone123"
+CLOUDFLARE_API_TOKEN="token456"
+WG_ENDPOINT_HOST="vpn.example.net"
+WG_GLOBAL_PEERS=(
+"name=phone address=10.192.100.2"
+)
+'
+  trap remove_fixture EXIT
+  local dir="$TEST_ROOT/clients"
+  render_all_peer_templates "$dir"
+  local f="$dir/wg_global-phone.conf"
+  _grep "Endpoint = vpn.example.net:51820" "$f"
+  _ngrep "home.example.com" "$f"
+}
+
+test_peer_endpoint_prefers_ipv4_literal_no_domain() {
+  # No domain and no explicit host: the detector's runtime state selects the
+  # public IPv4 literal in preference to IPv6.
+  _prep "$NODOMAIN_PEER_CONFIG"
+  trap remove_fixture EXIT
+  install -d -m 0755 "$(dirname "$INGRESS_STATE_FILE")"
+  cat >"$INGRESS_STATE_FILE" <<'EOF'
+INGRESS_IPV4="203.0.113.9"
+INGRESS_IPV4_STATE="available"
+INGRESS_IPV6="2001:db8::1"
+INGRESS_IPV6_STATE="available"
+INGRESS_PREFERRED_FAMILY="ipv4"
+INGRESS_PREFERRED_LITERAL="203.0.113.9"
+EOF
+  local dir="$TEST_ROOT/clients"
+  render_all_peer_templates "$dir"
+  local f="$dir/wg_global-phone.conf"
+  _grep "Endpoint = 203.0.113.9:51820" "$f"
+  _ngrep "Endpoint = [203.0.113.9]:51820" "$f"
+}
+
+test_peer_endpoint_ipv6_literal_when_no_ipv4() {
+  # No domain, no explicit host, only a public IPv6 detected: use the bracketed
+  # IPv6 literal.
+  _prep "$NODOMAIN_PEER_CONFIG"
+  trap remove_fixture EXIT
+  install -d -m 0755 "$(dirname "$INGRESS_STATE_FILE")"
+  cat >"$INGRESS_STATE_FILE" <<'EOF'
+INGRESS_IPV4=""
+INGRESS_IPV4_STATE="unavailable"
+INGRESS_IPV6="2001:db8::99"
+INGRESS_IPV6_STATE="available"
+INGRESS_PREFERRED_FAMILY="ipv6"
+INGRESS_PREFERRED_LITERAL="2001:db8::99"
+EOF
+  local dir="$TEST_ROOT/clients"
+  render_all_peer_templates "$dir"
+  local f="$dir/wg_global-phone.conf"
+  _grep "Endpoint = [2001:db8::99]:51820" "$f"
 }
 
 # ==================== Transactional install + rollback ====================
@@ -923,10 +1118,11 @@ test_no_connectivity_wait_or_rollback() {
   local rc=0
   ( install_client ) </dev/null >/dev/null 2>&1 || rc=$?
   ((rc == 0)) || fail "install must not depend on WAN connectivity"
-  # Static guarantee: no polling/carrier/ping/ubus status wait exists. The ubus
-  # match targets an invoked `ubus` command (followed by whitespace), so the
-  # public-LuCI uhttpd `ubus_prefix`/`/ubus` config tokens are not false hits.
-  ! grep -Eq '\bping\b|operstate|carrier|\bubus[[:space:]]' "$SCRIPT_PATH" ||
+  # Static guarantee: no polling/carrier/ping connectivity wait exists. The
+  # ingress detector reads interface state via a single non-blocking `ubus`
+  # status call (backgrounded on hotplug), so ubus itself is allowed; only
+  # active connectivity waits are forbidden.
+  ! grep -Eq '\bping\b|operstate|carrier' "$SCRIPT_PATH" ||
     fail "script must not wait on connectivity"
 }
 
@@ -1299,7 +1495,7 @@ test_homeproxy_absent_without_vps() {
 
 # ==================== Firewall / uhttpd / acme ====================
 
-test_firewall_luci_public_ipv6_only() {
+test_firewall_luci_public_family_any() {
   _prep "$VALID_CONFIG"
   trap remove_fixture EXIT
   local out="$TEST_ROOT/fw.uci"
@@ -1307,25 +1503,27 @@ test_firewall_luci_public_ipv6_only() {
   _grep "set firewall.luci_public_in.src='wan'" "$out"
   _grep "set firewall.luci_public_in.proto='tcp'" "$out"
   _grep "set firewall.luci_public_in.dest_port='10443'" "$out"
-  _grep "set firewall.luci_public_in.family='ipv6'" "$out"
+  _grep "set firewall.luci_public_in.family='any'" "$out"
   _grep "set firewall.luci_public_in.target='ACCEPT'" "$out"
+  _ngrep "set firewall.luci_public_in.family='ipv6'" "$out"
 }
 
-test_uhttpd_ipv6_only_https() {
+test_uhttpd_dual_stack_https() {
   _prep "$VALID_CONFIG"
   trap remove_fixture EXIT
   local out="$TEST_ROOT/uh.uci"
   : >"$out"
   render_uhttpd_batch "$out"
   _grep "set uhttpd.vpnpublic=uhttpd" "$out"
+  # Dual-stack: both the IPv4 and IPv6 wildcard HTTPS listeners are present.
+  _grep "add_list uhttpd.vpnpublic.listen_https='0.0.0.0:10443'" "$out"
   _grep "add_list uhttpd.vpnpublic.listen_https='[::]:10443'" "$out"
   _grep "set uhttpd.vpnpublic.redirect_https='0'" "$out"
   _grep "delete uhttpd.vpnpublic.listen_http" "$out"
   _grep "luci-public.crt" "$out"
   _grep "luci-public.key" "$out"
-  # No plain-HTTP listener and no IPv4 bind.
+  # No plain-HTTP listener is created.
   _ngrep "uhttpd.vpnpublic.listen_http='" "$out"
-  _ngrep "0.0.0.0:" "$out"
 }
 
 test_uhttpd_letsencrypt_cert_path() {
@@ -1389,67 +1587,303 @@ test_ddns_disabled_without_domain() {
   assert_failure ddns_enabled
 }
 
-test_ddns_updater_stable_gua_dns_only() {
-  _prep "$DDNS_CONFIG"
+test_ingress_updater_posix_sh_syntax() {
+  _render_detector "$INGRESS_CONFIG"
   trap remove_fixture EXIT
-  local f="$TEST_ROOT/ddns.sh"
-  render_ddns_updater "$f"
-  assert_eq "700" "$(stat -c '%a' "$f")" "updater mode 0700"
-  _grep "api.cloudflare.com" "$f"
-  _grep '"proxied":false' "$f"
-  _grep "home.example.com" "$f"
-  _grep "token456" "$f"
-  _grep "zone123" "$f"
-  # Stable-GUA selection skips temporary/deprecated addresses.
-  _grep "scope global" "$f"
-  _grep "temporary" "$f"
-  _grep "deprecated" "$f"
+  assert_eq "700" "$(stat -c '%a' "$TEST_ROOT/ingress-update")" "updater mode 0700"
+  # The detector runs under ash/busybox at runtime; it must be POSIX-sh clean.
+  sh -n "$TEST_ROOT/ingress-update" || fail "detector is not POSIX-sh clean"
 }
 
-test_ddns_updater_uses_bearer_api_token() {
-  _prep "$DDNS_CONFIG"
+test_ingress_updater_content() {
+  _render_detector "$INGRESS_CONFIG"
   trap remove_fixture EXIT
-  local f="$TEST_ROOT/ddns.sh"
-  render_ddns_updater "$f"
-  # The Cloudflare auth header must reference the API_TOKEN variable (Bearer
-  # scheme), and the token must be defined exactly once via API_TOKEN=.
-  _grep 'auth="Authorization: Bearer ${API_TOKEN}"' "$f"
+  local f="$TEST_ROOT/ingress-update"
+  _grep "api.cloudflare.com" "$f"
+  # DNS-only (grey cloud) records tagged with the managed-by comment.
+  _grep '"proxied":false' "$f"
+  _grep "managed-by=vpn-node" "$f"
+  # Both A and AAAA are synchronised.
+  _grep "AAAA" "$f"
+  _grepe 'sync_family A ' "$f"
+  _grepe 'sync_family AAAA ' "$f"
+  # Credentials are baked in; the token flows through a variable ($auth), never
+  # inline on the Authorization header line.
+  _grep "home.example.com" "$f"
   _grep 'API_TOKEN=' "$f"
-  # curl must send the header through the $auth variable, never a literal token.
   _grep 'curl -fsS -H "$auth"' "$f"
-  # The secret value must never be inlined on the Authorization header line.
   local auth_line
   auth_line="$(grep -F 'Authorization:' "$f" || true)"
   case "$auth_line" in
     *token456*) fail "the token must not appear in the Authorization header line" ;;
   esac
+  # Stable-GUA selection skips temporary/deprecated addresses.
+  _grep "temporary" "$f"
+  _grep "deprecated" "$f"
 }
 
-test_ddns_hotplug_triggers_on_wan6() {
-  _prep "$DDNS_CONFIG"
+test_ingress_state_dual_stack() {
+  _render_detector "$INGRESS_CONFIG"
+  trap remove_fixture EXIT
+  printf '{"up":true,"ipv4-address":[{"address":"203.0.113.5","mask":24}]}\n' \
+    >"$TEST_ROOT/ctl/ubus.wan"
+  printf '203.0.113.5' >"$TEST_ROOT/ctl/observe_ip"
+  printf '    inet6 2001:db8::1/64 scope global dynamic\n       valid_lft 100sec preferred_lft 90sec\n' \
+    >"$TEST_ROOT/ctl/ip6_addr"
+  printf 'default via fe80::1 dev eth0 proto ra metric 512\n' >"$TEST_ROOT/ctl/ip6_route"
+  _run_detector --boot
+  local s; s="$(_state_file)"
+  _grep 'INGRESS_IPV4="203.0.113.5"' "$s"
+  _grep 'INGRESS_IPV4_STATE="available"' "$s"
+  _grep 'INGRESS_IPV6="2001:db8::1"' "$s"
+  _grep 'INGRESS_IPV6_STATE="available"' "$s"
+  _grep 'INGRESS_PREFERRED_FAMILY="ipv4"' "$s"
+  _grep 'INGRESS_PREFERRED_LITERAL="203.0.113.5"' "$s"
+  # Both records are published.
+  grep -q '^POST' "$(_cf_log)" || fail "expected Cloudflare create calls"
+  grep -q 'type":"A"' "$(_cf_log)" || fail "expected an A record body"
+  grep -q 'type":"AAAA"' "$(_cf_log)" || fail "expected an AAAA record body"
+}
+
+test_ingress_ipv4_private_unavailable() {
+  _render_detector "$INGRESS_CONFIG"
+  trap remove_fixture EXIT
+  printf '{"ipv4-address":[{"address":"192.168.1.2","mask":24}]}\n' >"$TEST_ROOT/ctl/ubus.wan"
+  printf '{"result":[{"id":"recA","type":"A","name":"home.example.com","content":"203.0.113.1","comment":"managed-by=vpn-node"}],"success":true}\n' \
+    >"$TEST_ROOT/ctl/cf_records_A.json"
+  _run_detector --boot
+  local s; s="$(_state_file)"
+  _grep 'INGRESS_IPV4_STATE="unavailable"' "$s"
+  _grep 'INGRESS_IPV4=""' "$s"
+  # A private WAN address means no public IPv4: the managed A record is deleted.
+  grep -q '^DELETE.*dns_records/recA' "$(_cf_log)" ||
+    fail "managed A record must be deleted when IPv4 is unavailable"
+}
+
+test_ingress_ipv4_cgnat_unavailable() {
+  _render_detector "$INGRESS_CONFIG"
+  trap remove_fixture EXIT
+  printf '{"ipv4-address":[{"address":"100.100.5.6","mask":10}]}\n' >"$TEST_ROOT/ctl/ubus.wan"
+  _run_detector --boot
+  _grep 'INGRESS_IPV4_STATE="unavailable"' "$(_state_file)"
+}
+
+test_ingress_ipv4_unknown_observer_down() {
+  _render_detector "$INGRESS_CONFIG"
+  trap remove_fixture EXIT
+  printf '{"ipv4-address":[{"address":"203.0.113.5","mask":24}]}\n' >"$TEST_ROOT/ctl/ubus.wan"
+  touch "$TEST_ROOT/ctl/observe_fail"
+  printf '{"result":[{"id":"recA","type":"A","name":"home.example.com","content":"203.0.113.5","comment":"managed-by=vpn-node"}],"success":true}\n' \
+    >"$TEST_ROOT/ctl/cf_records_A.json"
+  _run_detector --boot
+  local s; s="$(_state_file)"
+  _grep 'INGRESS_IPV4_STATE="unknown"' "$s"
+  # Unknown observation must never delete DNS.
+  ! grep -q 'DELETE' "$(_cf_log)" ||
+    fail "unknown IPv4 state must preserve the A record"
+}
+
+test_ingress_ipv4_unknown_observer_mismatch() {
+  _render_detector "$INGRESS_CONFIG"
+  trap remove_fixture EXIT
+  printf '{"ipv4-address":[{"address":"203.0.113.5","mask":24}]}\n' >"$TEST_ROOT/ctl/ubus.wan"
+  # Observer reports a different public address (double-NAT); cannot confirm.
+  printf '198.51.100.7' >"$TEST_ROOT/ctl/observe_ip"
+  printf '{"result":[{"id":"recA","type":"A","name":"home.example.com","content":"203.0.113.5","comment":"managed-by=vpn-node"}],"success":true}\n' \
+    >"$TEST_ROOT/ctl/cf_records_A.json"
+  _run_detector --boot
+  _grep 'INGRESS_IPV4_STATE="unknown"' "$(_state_file)"
+  ! grep -q 'DELETE' "$(_cf_log)" ||
+    fail "a mismatched observation must preserve the A record"
+}
+
+test_ingress_ipv6_only_and_preferred() {
+  _render_detector "$INGRESS_CONFIG"
+  trap remove_fixture EXIT
+  # No public IPv4; a stable GUA with a default route.
+  printf '{"ipv4-address":[{"address":"10.0.0.2","mask":24}]}\n' >"$TEST_ROOT/ctl/ubus.wan"
+  printf '    inet6 2001:db8::abc/64 scope global dynamic\n       valid_lft 100sec preferred_lft 90sec\n' \
+    >"$TEST_ROOT/ctl/ip6_addr"
+  printf 'default via fe80::1 dev eth0 proto ra\n' >"$TEST_ROOT/ctl/ip6_route"
+  _run_detector --boot
+  local s; s="$(_state_file)"
+  _grep 'INGRESS_IPV4_STATE="unavailable"' "$s"
+  _grep 'INGRESS_IPV6_STATE="available"' "$s"
+  _grep 'INGRESS_PREFERRED_FAMILY="ipv6"' "$s"
+  _grep 'INGRESS_PREFERRED_LITERAL="2001:db8::abc"' "$s"
+}
+
+test_ingress_ipv6_temporary_excluded() {
+  _render_detector "$INGRESS_CONFIG"
+  trap remove_fixture EXIT
+  printf '{"ipv4-address":[]}\n' >"$TEST_ROOT/ctl/ubus.wan"
+  # Only temporary/privacy and ULA addresses -> no stable GUA.
+  printf '    inet6 2001:db8::dead/64 scope global temporary dynamic\n       valid_lft 60sec preferred_lft 30sec\n    inet6 fd00::1/64 scope global\n       valid_lft forever preferred_lft forever\n' \
+    >"$TEST_ROOT/ctl/ip6_addr"
+  printf 'default via fe80::1 dev eth0 proto ra\n' >"$TEST_ROOT/ctl/ip6_route"
+  printf '{"result":[{"id":"recQ","type":"AAAA","name":"home.example.com","content":"2001:db8::dead","comment":"managed-by=vpn-node"}],"success":true}\n' \
+    >"$TEST_ROOT/ctl/cf_records_AAAA.json"
+  _run_detector --boot
+  _grep 'INGRESS_IPV6_STATE="unavailable"' "$(_state_file)"
+  grep -q '^DELETE.*dns_records/recQ' "$(_cf_log)" ||
+    fail "managed AAAA must be deleted when no stable GUA exists"
+}
+
+test_ingress_ipv6_requires_default_route() {
+  _render_detector "$INGRESS_CONFIG"
+  trap remove_fixture EXIT
+  printf '{"ipv4-address":[]}\n' >"$TEST_ROOT/ctl/ubus.wan"
+  printf '    inet6 2001:db8::1/64 scope global dynamic\n       valid_lft 100sec preferred_lft 90sec\n' \
+    >"$TEST_ROOT/ctl/ip6_addr"
+  : >"$TEST_ROOT/ctl/ip6_route"
+  _run_detector --boot
+  _grep 'INGRESS_IPV6_STATE="unavailable"' "$(_state_file)"
+}
+
+test_ingress_ddns_creates_when_absent() {
+  _render_detector "$INGRESS_CONFIG"
+  trap remove_fixture EXIT
+  printf '{"ipv4-address":[{"address":"203.0.113.5","mask":24}]}\n' >"$TEST_ROOT/ctl/ubus.wan"
+  printf '203.0.113.5' >"$TEST_ROOT/ctl/observe_ip"
+  printf '{"result":[],"success":true}\n' >"$TEST_ROOT/ctl/cf_records_A.json"
+  _run_detector --boot
+  local l; l="$(_cf_log)"
+  grep -q '^POST.*dns_records' "$l" || fail "expected a create (POST)"
+  grep -q 'content":"203.0.113.5"' "$l" || fail "create must carry the address"
+  grep -q 'comment":"managed-by=vpn-node"' "$l" || fail "create must set managed comment"
+  grep -q 'proxied":false' "$l" || fail "record must be DNS-only"
+}
+
+test_ingress_ddns_updates_managed() {
+  _render_detector "$INGRESS_CONFIG"
+  trap remove_fixture EXIT
+  printf '{"ipv4-address":[{"address":"203.0.113.5","mask":24}]}\n' >"$TEST_ROOT/ctl/ubus.wan"
+  printf '203.0.113.5' >"$TEST_ROOT/ctl/observe_ip"
+  printf '{"result":[{"id":"recA","type":"A","name":"home.example.com","content":"203.0.113.1","comment":"managed-by=vpn-node"}],"success":true}\n' \
+    >"$TEST_ROOT/ctl/cf_records_A.json"
+  _run_detector --boot
+  grep -q '^PUT.*dns_records/recA' "$(_cf_log)" ||
+    fail "an existing managed A record must be updated in place"
+}
+
+test_ingress_ddns_deletes_only_managed() {
+  _render_detector "$INGRESS_CONFIG"
+  trap remove_fixture EXIT
+  printf '{"ipv4-address":[{"address":"192.168.1.2","mask":24}]}\n' >"$TEST_ROOT/ctl/ubus.wan"
+  printf '{"result":[{"id":"recA","type":"A","name":"home.example.com","content":"203.0.113.1","comment":"managed-by=vpn-node"},{"id":"recU","type":"A","name":"home.example.com","content":"198.51.100.9","comment":"hand managed"}],"success":true}\n' \
+    >"$TEST_ROOT/ctl/cf_records_A.json"
+  _run_detector --boot
+  local l; l="$(_cf_log)"
+  grep -q '^DELETE.*dns_records/recA' "$l" || fail "the managed record must be deleted"
+  ! grep -q 'dns_records/recU' "$l" || fail "unmanaged records must never be touched"
+}
+
+test_ingress_ddns_unknown_preserves() {
+  _render_detector "$INGRESS_CONFIG"
+  trap remove_fixture EXIT
+  printf '{"ipv4-address":[{"address":"203.0.113.5","mask":24}]}\n' >"$TEST_ROOT/ctl/ubus.wan"
+  touch "$TEST_ROOT/ctl/observe_fail"
+  printf '{"result":[{"id":"recA","type":"A","name":"home.example.com","content":"203.0.113.5","comment":"managed-by=vpn-node"}],"success":true}\n' \
+    >"$TEST_ROOT/ctl/cf_records_A.json"
+  _run_detector --boot
+  local l; l="$(_cf_log)"
+  ! grep -q 'DELETE' "$l" || fail "unknown state must not delete"
+  ! grep -q '^POST' "$l" || fail "unknown state must not create"
+  ! grep -q '^PUT' "$l" || fail "unknown state must not update"
+}
+
+test_ingress_ddns_ambiguous_managed_skips() {
+  _render_detector "$INGRESS_CONFIG"
+  trap remove_fixture EXIT
+  printf '{"ipv4-address":[{"address":"203.0.113.5","mask":24}]}\n' >"$TEST_ROOT/ctl/ubus.wan"
+  printf '203.0.113.5' >"$TEST_ROOT/ctl/observe_ip"
+  printf '{"result":[{"id":"recA","type":"A","name":"home.example.com","content":"203.0.113.1","comment":"managed-by=vpn-node"},{"id":"recB","type":"A","name":"home.example.com","content":"203.0.113.2","comment":"managed-by=vpn-node"}],"success":true}\n' \
+    >"$TEST_ROOT/ctl/cf_records_A.json"
+  _run_detector --boot
+  local l; l="$(_cf_log)"
+  ! grep -q '^PUT' "$l" || fail "ambiguous managed records must not be updated"
+  ! grep -q '^POST' "$l" || fail "ambiguous managed records must not be created"
+  grep -qi 'ambiguous' "$TEST_ROOT/ctl/logger.log" || fail "ambiguity must be logged"
+}
+
+test_ingress_no_ddns_without_domain() {
+  _render_detector "$NODOMAIN_PEER_CONFIG"
+  trap remove_fixture EXIT
+  printf '{"ipv4-address":[{"address":"203.0.113.5","mask":24}]}\n' >"$TEST_ROOT/ctl/ubus.wan"
+  printf '203.0.113.5' >"$TEST_ROOT/ctl/observe_ip"
+  _run_detector --boot
+  # Status is still recorded, but no Cloudflare traffic is generated.
+  _grep 'INGRESS_IPV4_STATE="available"' "$(_state_file)"
+  [[ ! -s "$TEST_ROOT/ctl/cf.log" ]] || fail "no domain means no Cloudflare calls"
+}
+
+test_ingress_lock_and_debounce() {
+  _render_detector "$INGRESS_CONFIG"
+  trap remove_fixture EXIT
+  printf '{"ipv4-address":[{"address":"203.0.113.5","mask":24}]}\n' >"$TEST_ROOT/ctl/ubus.wan"
+  printf '203.0.113.5' >"$TEST_ROOT/ctl/observe_ip"
+  printf '{"result":[],"success":true}\n' >"$TEST_ROOT/ctl/cf_records_A.json"
+  _run_detector --boot
+  local before after
+  before="$(wc -l <"$(_cf_log)")"
+  # A cron run immediately after boot is debounced (coalesced).
+  _run_detector --cron
+  after="$(wc -l <"$(_cf_log)")"
+  assert_eq "$before" "$after" "cron run within the debounce window must be skipped"
+  [[ -e "$TEST_ROOT/iroot/var/lock/vpn-node-ingress.lock" ]] ||
+    fail "a single-flight lock file must be used"
+}
+
+test_ingress_initd_procd() {
+  _prep "$VALID_CONFIG"
+  trap remove_fixture EXIT
+  local f="$TEST_ROOT/initd"
+  render_ingress_initd "$f"
+  assert_eq "755" "$(stat -c '%a' "$f")" "init.d mode 0755"
+  _grep "USE_PROCD=1" "$f"
+  _grepe "^START=" "$f"
+  _grep "/usr/libexec/vpn-node/ingress-update" "$f"
+  _grep "ingress-update --boot" "$f"
+}
+
+test_ingress_hotplug_triggers_wan_families() {
+  _prep "$VALID_CONFIG"
   trap remove_fixture EXIT
   local f="$TEST_ROOT/hotplug"
-  render_ddns_hotplug "$f"
+  render_ingress_hotplug "$f"
   assert_eq "755" "$(stat -c '%a' "$f")" "hotplug mode 0755"
-  _grep 'ifup' "$f"
-  _grep 'wan6' "$f"
-  _grep 'wanpppoe6' "$f"
-  _grep "cloudflare-aaaa.sh" "$f"
+  _grep "ifup" "$f"
+  # IPv4 and IPv6 WAN logical interfaces all trigger detection now.
+  _grep "wan" "$f"
+  _grep "wan6" "$f"
+  _grep "wanpppoe" "$f"
+  _grep "wanpppoe6" "$f"
+  _grep "/usr/libexec/vpn-node/ingress-update" "$f"
+  # Backgrounded so a slow detector never blocks netifd.
+  _grepe '&[[:space:]]*;;' "$f"
 }
 
-test_ddns_crontab_entry() {
-  _prep "$DDNS_CONFIG"
+test_ingress_crontab_every_5min() {
+  _prep "$VALID_CONFIG"
   trap remove_fixture EXIT
+  install -d -m 0755 "$(dirname "$CRONTAB_ROOT")"
+  printf '0 3 * * * /root/other-job\n*/15 * * * * /old/ingress %s stale\n' \
+    "$INGRESS_CRON_TAG" >"$CRONTAB_ROOT"
   local f="$TEST_ROOT/cron"
-  render_ddns_crontab "$f"
-  _grep "cloudflare-aaaa.sh" "$f"
-  _grep "#vpn-node-ddns" "$f"
-  _grepe "^\*/[0-9]+ " "$f"
+  render_ingress_crontab "$f"
+  assert_eq "600" "$(stat -c '%a' "$f")" "crontab mode 0600"
+  _grep "/usr/libexec/vpn-node/ingress-update" "$f"
+  _grep "#vpn-node-ingress" "$f"
+  _grepe "^\*/5 " "$f"
+  # Foreign entries are preserved; the stale tagged line is replaced (only one).
+  _grep "/root/other-job" "$f"
+  _ngrep "/old/ingress" "$f"
+  assert_eq "1" "$(grep -c "$INGRESS_CRON_TAG" "$f")" "exactly one tagged cron line"
 }
 
-# ==================== Full install (Task-4 artifacts) ====================
+# ==================== Full install (proxy/LuCI/ingress artifacts) ====================
 
-test_install_writes_proxy_luci_ddns_artifacts() {
+test_install_writes_proxy_luci_ingress_artifacts() {
   _prep "$DDNS_CONFIG"
   trap remove_fixture EXIT
   local rc=0
@@ -1462,16 +1896,21 @@ test_install_writes_proxy_luci_ddns_artifacts() {
   [[ -f "$HY2_CA_FILE" ]] || fail "HY2 self-signed trust anchor not installed"
   [[ -f "$LUCI_PUBLIC_CRT" && -f "$LUCI_PUBLIC_KEY_FILE" ]] ||
     fail "public LuCI self-signed cert/key not installed"
-  [[ -f "$DDNS_UPDATER" ]] || fail "DDNS updater not installed"
-  assert_eq "700" "$(stat -c '%a' "$DDNS_UPDATER")" "updater mode"
-  [[ -f "$DDNS_HOTPLUG" ]] || fail "DDNS hotplug hook not installed"
-  grep -q "#vpn-node-ddns" "$CRONTAB_ROOT" || fail "DDNS cron entry not installed"
+  # Dual-stack ingress detector + procd + hotplug + cron.
+  [[ -f "$INGRESS_UPDATER" ]] || fail "ingress detector not installed"
+  assert_eq "700" "$(stat -c '%a' "$INGRESS_UPDATER")" "detector mode"
+  [[ -f "$INGRESS_INITD" ]] || fail "ingress procd service not installed"
+  assert_eq "755" "$(stat -c '%a' "$INGRESS_INITD")" "init.d mode"
+  [[ -f "$INGRESS_HOTPLUG" ]] || fail "ingress hotplug hook not installed"
+  grep -q "#vpn-node-ingress" "$CRONTAB_ROOT" || fail "ingress cron entry not installed"
   grep -q '^ARGS: uhttpd reload' "$TEST_ROOT/service-args.log" ||
     fail "public uhttpd must be reloaded"
   grep -q '^ARGS: homeproxy restart' "$TEST_ROOT/service-args.log" ||
     fail "homeproxy must be restarted"
+  grep -q '^ARGS: vpn-node-ingress' "$TEST_ROOT/service-args.log" ||
+    fail "the ingress service must be enabled/started"
   grep -q '^ARGS: cron restart' "$TEST_ROOT/service-args.log" ||
-    fail "cron must be restarted for the DDNS job"
+    fail "cron must be restarted for the ingress job"
 }
 
 test_install_selfsigned_luci_has_no_acme() {
@@ -1483,17 +1922,19 @@ test_install_selfsigned_luci_has_no_acme() {
   [[ -f "$LUCI_PUBLIC_CRT" ]] || fail "self-signed LuCI cert must be generated"
   ! grep -q "acme.luci_public" "$TEST_ROOT/uci-cmd.log" ||
     fail "no acme config in self-signed mode"
-  # DDNS not configured here.
-  [[ ! -e "$DDNS_UPDATER" ]] || fail "no DDNS updater without a home domain"
+  # The detector is always installed, but without a domain it carries no
+  # Cloudflare credentials and performs no DNS sync.
+  [[ -f "$INGRESS_UPDATER" ]] || fail "ingress detector must always be installed"
+  grep -q "DOMAIN=''" "$INGRESS_UPDATER" || fail "no domain must be baked in"
 }
 
-test_rollback_removes_task4_artifacts() {
+test_rollback_removes_ingress_artifacts() {
   _prep "$DDNS_CONFIG"
   trap remove_fixture EXIT
   install -d -m 0755 "$UCI_CONFIG_DIR"
   printf '# PRIOR-NETWORK\n' >"$NETWORK_CONFIG"
   # Commit succeeds; a service reload fails, so rollback must remove every new
-  # Task-4 artifact and restore the prior config.
+  # artifact and restore the prior config.
   touch "$TEST_ROOT/ctl/service_fail"
   local rc=0
   ( install_client ) </dev/null >/dev/null 2>&1 || rc=$?
@@ -1501,8 +1942,9 @@ test_rollback_removes_task4_artifacts() {
   _grep "# PRIOR-NETWORK" "$NETWORK_CONFIG"
   [[ ! -e "$HY2_CA_FILE" ]] || fail "HY2 trust anchor must be rolled back"
   [[ ! -e "$LUCI_PUBLIC_CRT" ]] || fail "LuCI cert must be rolled back"
-  [[ ! -e "$DDNS_UPDATER" ]] || fail "DDNS updater must be rolled back"
-  [[ ! -e "$DDNS_HOTPLUG" ]] || fail "DDNS hotplug must be rolled back"
+  [[ ! -e "$INGRESS_UPDATER" ]] || fail "ingress detector must be rolled back"
+  [[ ! -e "$INGRESS_INITD" ]] || fail "ingress procd service must be rolled back"
+  [[ ! -e "$INGRESS_HOTPLUG" ]] || fail "ingress hotplug must be rolled back"
 }
 
 test_no_login_lockout_mechanism() {
@@ -1556,7 +1998,7 @@ run_test "no hardcoded device names" test_no_hardcoded_device_names
 
 run_test "firewall LAN zone includes WG" test_firewall_lan_zone_includes_wg
 run_test "firewall WAN zone includes WAN6" test_firewall_wan_zone_includes_wan6
-run_test "firewall WG rules IPv6-only" test_firewall_wg_rules_ipv6_only
+run_test "firewall WG rules family any" test_firewall_wg_rules_family_any
 
 run_test "dhcp filters AAAA and disables LAN IPv6" test_dhcp_filters_aaaa_and_disables_lan_ipv6
 
@@ -1569,6 +2011,10 @@ run_test "peer template content and mode" test_peer_template_content_and_mode
 run_test "peer endpoint IPv6 literal is bracketed" test_peer_endpoint_ipv6_literal_is_bracketed
 run_test "peer endpoint hostname is unbracketed" test_peer_endpoint_hostname_is_unbracketed
 run_test "peer endpoint IPv4 literal is unbracketed" test_peer_endpoint_ipv4_literal_is_unbracketed
+run_test "peer endpoint uses domain when no host" test_peer_endpoint_uses_domain_when_no_host
+run_test "peer endpoint explicit host overrides domain" test_peer_endpoint_explicit_host_overrides_domain
+run_test "peer endpoint prefers IPv4 literal (no domain)" test_peer_endpoint_prefers_ipv4_literal_no_domain
+run_test "peer endpoint IPv6 literal when no IPv4" test_peer_endpoint_ipv6_literal_when_no_ipv4
 
 run_test "successful install writes all artifacts" test_successful_install_writes_all_artifacts
 run_test "rollback on validation failure leaves nothing" test_rollback_on_validation_failure_leaves_nothing
@@ -1608,8 +2054,8 @@ run_test "homeproxy main node switchable" test_homeproxy_main_node_switchable
 run_test "homeproxy hopping ports" test_homeproxy_hopping_ports
 run_test "homeproxy absent without VPS" test_homeproxy_absent_without_vps
 
-run_test "firewall LuCI public IPv6-only" test_firewall_luci_public_ipv6_only
-run_test "uhttpd IPv6-only HTTPS" test_uhttpd_ipv6_only_https
+run_test "firewall LuCI public family any" test_firewall_luci_public_family_any
+run_test "uhttpd dual-stack HTTPS" test_uhttpd_dual_stack_https
 run_test "uhttpd letsencrypt cert path" test_uhttpd_letsencrypt_cert_path
 run_test "uhttpd ubus_prefix for LuCI" test_uhttpd_ubus_prefix_for_luci
 run_test "acme letsencrypt dns_cf" test_acme_letsencrypt_dns_cf
@@ -1617,14 +2063,30 @@ run_test "acme absent when selfsigned" test_acme_absent_when_selfsigned
 
 run_test "ddns enabled gating" test_ddns_enabled_gating
 run_test "ddns disabled without domain" test_ddns_disabled_without_domain
-run_test "ddns updater stable GUA DNS-only" test_ddns_updater_stable_gua_dns_only
-run_test "ddns updater uses Bearer API_TOKEN" test_ddns_updater_uses_bearer_api_token
-run_test "ddns hotplug triggers on wan6" test_ddns_hotplug_triggers_on_wan6
-run_test "ddns crontab entry" test_ddns_crontab_entry
+run_test "ingress updater POSIX-sh syntax" test_ingress_updater_posix_sh_syntax
+run_test "ingress updater content" test_ingress_updater_content
+run_test "ingress state dual-stack" test_ingress_state_dual_stack
+run_test "ingress IPv4 private is unavailable" test_ingress_ipv4_private_unavailable
+run_test "ingress IPv4 CGNAT is unavailable" test_ingress_ipv4_cgnat_unavailable
+run_test "ingress IPv4 unknown when observer down" test_ingress_ipv4_unknown_observer_down
+run_test "ingress IPv4 unknown on observer mismatch" test_ingress_ipv4_unknown_observer_mismatch
+run_test "ingress IPv6-only preferred" test_ingress_ipv6_only_and_preferred
+run_test "ingress IPv6 temporary excluded" test_ingress_ipv6_temporary_excluded
+run_test "ingress IPv6 requires default route" test_ingress_ipv6_requires_default_route
+run_test "ingress DDNS creates when absent" test_ingress_ddns_creates_when_absent
+run_test "ingress DDNS updates managed" test_ingress_ddns_updates_managed
+run_test "ingress DDNS deletes only managed" test_ingress_ddns_deletes_only_managed
+run_test "ingress DDNS unknown preserves" test_ingress_ddns_unknown_preserves
+run_test "ingress DDNS ambiguous managed skips" test_ingress_ddns_ambiguous_managed_skips
+run_test "ingress no DDNS without domain" test_ingress_no_ddns_without_domain
+run_test "ingress lock and debounce" test_ingress_lock_and_debounce
+run_test "ingress init.d procd" test_ingress_initd_procd
+run_test "ingress hotplug triggers WAN families" test_ingress_hotplug_triggers_wan_families
+run_test "ingress crontab every 5 min" test_ingress_crontab_every_5min
 
-run_test "install writes proxy/LuCI/DDNS artifacts" test_install_writes_proxy_luci_ddns_artifacts
+run_test "install writes proxy/LuCI/ingress artifacts" test_install_writes_proxy_luci_ingress_artifacts
 run_test "install selfsigned LuCI has no acme" test_install_selfsigned_luci_has_no_acme
-run_test "rollback removes Task-4 artifacts" test_rollback_removes_task4_artifacts
+run_test "rollback removes ingress artifacts" test_rollback_removes_ingress_artifacts
 run_test "no login lockout mechanism" test_no_login_lockout_mechanism
 
 finish_tests
